@@ -2,3 +2,10 @@
 Features bulk force-stopping, a fast cache cleaner, live RAM stats, and a custom whitelist. Uses an efficient Accessibility Service that sleeps when idle for zero battery drain.
 
 This app has been built in collaboration with Google AI Studio.
+
+## Features
+- Accessibility-driven bulk force-stop automation.
+- Multi-OEM cache cleaning automation (Pixel, Samsung, OnePlus, Xiaomi).
+- Real-time RAM statistics and app cache size queries.
+- Whitelist apps to prevent force stopping.
+- Full Material 3 design system, colors, and layout aesthetics.
