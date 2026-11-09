@@ -1,0 +1,6 @@
+{
+  "name": "Stop it",
+  "description": "Easily manage running background apps, whitelist trusted applications, and automate force stop with Accessibility.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

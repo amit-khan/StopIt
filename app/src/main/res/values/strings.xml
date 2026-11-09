@@ -1,0 +1,54 @@
+<resources>
+    <string name="app_name">Stop it</string>
+    <string name="accessibility_service_name">Stop it Automation</string>
+    <string name="accessibility_service_description">Automates closing background apps by clicking Force Stop in system App Settings on your behalf.</string>
+
+    <!-- Navigation & Tabs -->
+    <string name="tab_running_apps">Running Apps</string>
+    <string name="tab_whitelist">Whitelist</string>
+
+    <!-- Dashboard -->
+    <string name="memory_title">RAM Usage</string>
+    <string name="avail_ram_format">Available: %1$s / Total: %2$s</string>
+    <string name="memory_used_percent">%1$d%% Used</string>
+    <string name="running_apps_count">%1$d running apps found</string>
+    <string name="stop_apps_button">Stop Selected Apps (%1$d)</string>
+    <string name="select_all">Select All</string>
+    <string name="deselect_all">Deselect All</string>
+
+    <!-- Search & Sections -->
+    <string name="search_hint">Search apps…</string>
+
+    <!-- Empty States -->
+    <string name="no_running_apps_title">All clear!</string>
+    <string name="no_running_apps_desc">No active apps running in the background.</string>
+    <string name="no_apps_found">No apps match your search</string>
+    <string name="empty_whitelist_title">No Whitelisted Apps</string>
+    <string name="empty_whitelist_desc">Add apps here to exclude them from the scan and prevent them from being stopped.</string>
+
+    <!-- Permissions Dialog -->
+    <string name="service_required_title">Accessibility Service Required</string>
+    <string name="service_required_message">To automatically click \"Force Stop\" in system settings, Stop it requires the Accessibility Service permission.\n\nTap \"Enable Service\" below, select \"Stop it\" in the list, and turn it ON.</string>
+    <string name="enable_service_btn">Enable Service</string>
+    <string name="cancel_btn">Cancel</string>
+
+    <!-- Overlay & Automation Progress -->
+    <string name="stopping_progress">Stopping %1$s (%2$d of %3$d)</string>
+    <string name="pause">Pause</string>
+    <string name="resume">Resume</string>
+    <string name="stop_process">Cancel</string>
+    <string name="automation_completed">Finished! Stopped %1$d apps.</string>
+    <string name="app_settings_hint">Tap icon to open system settings</string>
+    <string name="app_whitelisted_snackbar">%1$s added to Whitelist</string>
+
+    <!-- Whitelist Add Apps Dialog -->
+    <string name="add_apps_button">Add Apps</string>
+    <string name="add_to_whitelist_title">Add to Whitelist</string>
+    <string name="done">Done</string>
+    <string name="search_installed_apps_hint">Search installed apps…</string>
+    <string name="available_apps_count">%1$d apps available</string>
+    <string name="no_apps_to_add">All apps are already whitelisted!</string>
+    <string name="clear_cache_hint">Clear cache for %1$s</string>
+    <string name="usage_access_prompt">Show app cache sizes (Requires Usage Access)</string>
+    <string name="cache_label">Cache: %1$s</string>
+</resources>

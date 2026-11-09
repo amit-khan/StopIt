@@ -1,0 +1,6 @@
+{
+  "summary":  "Architectural blueprint and implementation plan for the App Cache Data Cleaner feature in Stop it. Details the dedicated CacheCleanerAutomationManager, AccessibilityService two-step navigation heuristics (Pixel 'Storage and cache' vs Samsung OneUI 'Storage', and 'Clear cache' button clicks), Usage Access (PACKAGE_USAGE_STATS) permission integration for reading real cache sizes, and UI integration of bin icons on Running and Whitelist app rows.",
+  "updatedAt":  "2026-11-08T18:29:38.268413392Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
