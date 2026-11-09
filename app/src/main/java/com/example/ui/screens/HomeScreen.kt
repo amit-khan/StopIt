@@ -31,14 +31,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -210,7 +208,7 @@ fun HomeScreen(
                             )
                         ) {
                             Icon(
-                                imageVector = Icons.Default.PowerSettingsNew,
+                                painter = painterResource(R.drawable.ic_power_settings),
                                 contentDescription = null,
                                 modifier = Modifier.size(22.dp)
                             )
@@ -476,7 +474,7 @@ fun HomeScreen(
                         } else if (runningApps.isEmpty()) {
                             item {
                                 EmptyStateCard(
-                                    icon = Icons.Default.CheckCircle,
+                                    painter = painterResource(R.drawable.ic_check_circle),
                                     title = stringResource(R.string.no_running_apps_title),
                                     subtitle = stringResource(R.string.no_running_apps_desc)
                                 )
@@ -524,7 +522,7 @@ fun HomeScreen(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.Shield,
+                                        painter = painterResource(R.drawable.ic_shield),
                                         contentDescription = null,
                                         tint = EmeraldPrimary,
                                         modifier = Modifier.size(24.dp)
@@ -592,7 +590,7 @@ fun HomeScreen(
                         if (filteredWhitelistedApps.isEmpty()) {
                             item {
                                 EmptyStateCard(
-                                    icon = Icons.Default.Shield,
+                                    painter = painterResource(R.drawable.ic_shield),
                                     title = if (uiState.searchQuery.isNotEmpty()) stringResource(R.string.no_apps_found) else stringResource(R.string.empty_whitelist_title),
                                     subtitle = if (uiState.searchQuery.isNotEmpty()) "" else stringResource(R.string.empty_whitelist_desc)
                                 )
@@ -669,7 +667,7 @@ fun TopAppBarHeader(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Default.PowerSettingsNew,
+                    painter = painterResource(R.drawable.ic_power_settings),
                     contentDescription = null,
                     tint = EmeraldPrimary,
                     modifier = Modifier.size(22.dp)
@@ -713,7 +711,7 @@ fun TopAppBarHeader(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (isAccessibilityEnabled) Icons.Default.CheckCircle else Icons.Default.Warning,
+                    painter = if (isAccessibilityEnabled) painterResource(R.drawable.ic_check_circle) else rememberVectorPainter(Icons.Default.Warning),
                     contentDescription = null,
                     tint = if (isAccessibilityEnabled) EmeraldPrimary else AccentAmber,
                     modifier = Modifier.size(14.dp)
@@ -733,7 +731,7 @@ fun TopAppBarHeader(
 
 @Composable
 fun EmptyStateCard(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    painter: androidx.compose.ui.graphics.painter.Painter,
     title: String,
     subtitle: String
 ) {
@@ -758,7 +756,7 @@ fun EmptyStateCard(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = icon,
+                    painter = painter,
                     contentDescription = null,
                     tint = EmeraldPrimary,
                     modifier = Modifier.size(32.dp)

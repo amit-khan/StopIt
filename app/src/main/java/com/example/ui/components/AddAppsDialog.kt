@@ -25,7 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Shield
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -232,7 +232,7 @@ fun AddAppsDialog(
                         contentAlignment = Alignment.Center
                     ) {
                         EmptyStateCard(
-                            icon = Icons.Default.Shield,
+                            painter = painterResource(R.drawable.ic_shield),
                             title = if (searchQuery.isNotEmpty()) {
                                 stringResource(R.string.no_apps_found)
                             } else {

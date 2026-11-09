@@ -1,128 +1,108 @@
-# App Cache Cleaner & Storage Stats Implementation Plan
+# APK Size Optimization & Dependency Trimming Plan
 
-This plan establishes a dedicated, reliable automation pipeline and storage inspection architecture for Stop it to clear individual application cache data in one tap, and display real-time cache sizes for listed applications.
+A targeted optimization strategy to trim the Stop it APK footprint from **~17 MB down to ~2–3 MB** (an ~85% reduction) by removing bloated icon libraries, pruning unused dependencies, and converting sparse icon references into lightweight local vector drawables, without changing any app behavior or functionality.
 
 ---
 
 ## User Review & Critical Decisions
 
 > [!IMPORTANT]
-> The plan incorporates your confirmed decisions from Phase 1:
-> - **Cache Size Measurement**: Declare `PACKAGE_USAGE_STATS` and integrate Android's `StorageStatsManager` to inspect and display real on-device cache sizes (KB/MB) per app. A seamless permission prompt will guide users to the "Usage Access" settings screen when needed.
-> - **Post-Clearing Navigation**: After successfully clicking "Clear cache" on the target app's storage page, the automation will remain on the app settings page as requested, smoothly entering low-power sleep mode without forcing back navigation.
-> - **Dedicated Single-App Automation Engine**: Keep the code DRY and modular by isolating the cache-clearing flow into a dedicated `CacheCleanerAutomationManager` file, distinct from the bulk force-stop queue logic.
+> **Key Finding — Source of Bloat Identified:**
+> - Inspection of `.build-outputs/app-debug.apk` revealed that DEX classes alone consume **over 55 MB uncompressed** across 9 multidex files.
+> - The primary culprit is `libs.androidx.compose.material.icons.extended` in `app/build.gradle.kts`. This single dependency packages over 10,000 Material icons into DEX, adding **~14 MB** of compressed overhead to the APK.
+> - The app only utilizes **7 icons** from this extended set: `PowerSettingsNew`, `Shield`, `AccessibilityNew`, `Pause`, `CheckCircle`, `Android`, and `Outlined.Delete`.
+> - **The Solution**: We will extract and bundle these 7 icons as native, compact Android XML vector drawables in `app/src/main/res/drawable/` (< 15 KB total) and completely remove `material.icons.extended`.
 
 ---
 
 ## 1. Overview & Core Concept
 
-- **What It Does**: Adds a dedicated cache cleaning action (bin icon) to each app row in both the Running Apps and Whitelist screens. Tapping the bin icon opens the app's settings, navigates to the Storage page (handling OEM differences across Google Pixel and Samsung OneUI), and clicks "Clear cache". Displays real-time formatted cache sizes (e.g., `14.2 MB`, `850 KB`) directly in the app list when Usage Access is enabled.
-- **Target Audience / Persona**: Users seeking to quickly reclaim disk space and remove bloated app caches without manually digging through nested Android system settings menus.
-- **Key Value**: One-tap cache cleaning and visibility into disk bloat across both active and whitelisted background applications.
+- **What This Delivers**: A dramatically lighter, faster-installing, and lower-memory APK (~2–3 MB) that launches quicker and consumes less disk storage on user devices.
+- **Scope & Safety**: Zero regressions. All existing features remain 100% functional:
+  - Accessibility-driven bulk force-stop automation.
+  - Multi-OEM cache cleaning automation (Pixel, Samsung OneUI, OnePlus, Xiaomi).
+  - Real-time RAM statistics and Usage Access cache size queries.
+  - Whitelist database persistence with Room.
+  - Full Material 3 design system, colors, and layout aesthetics.
 
 ---
 
 ## 2. User Experience & Visual Design
 
-### Key User Flows
-
-1. **Viewing Cache Sizes**:
-   - Each app row displays the App Icon, App Title, and a secondary caption showing formatted cache size (e.g. `Cache: 18.4 MB` or `Cache: < 1 MB`).
-   - If Usage Access is not yet granted, a discrete info banner or chip at the top of the list prompts the user: *"Tap to show app cache sizes (Requires Usage Access)"*. Clicking it directs straight to `Settings.ACTION_USAGE_ACCESS_SETTINGS`.
-2. **Clearing an App's Cache**:
-   - User taps the bin icon (`DeleteOutline`) on any app row.
-   - The app launches `Settings.ACTION_APPLICATION_DETAILS_SETTINGS` for the target package.
-   - `CacheCleanerAutomationManager` coordinates with `ForceStopAccessibilityService`:
-     - **Step 1**: Detects and clicks `"Storage and cache"` (Google Pixel / stock Android) or `"Storage"` (Samsung OneUI / other OEMs).
-     - **Step 2**: Waits for the storage sub-page to render and locates the `"Clear cache"` button (or OEM localized equivalents).
-     - **Step 3**: Clicks `"Clear cache"`, verifies execution, puts the service back to sleep, and stays on the settings page as requested.
-   - A haptic pulse and completion toast/snackbar confirm that the cache was cleared.
-
-### Visual Identity & Layout
-
-- **Bin Icon Placement**: Positioned immediately to the left of the Checkbox (Running Apps) or Toggle Switch (Whitelist) on each row.
-- **Touch Target & Styling**: 40dp x 40dp interactive component with ripple effect, styled with `TextSecondary` (or subtle `AccentRed.copy(alpha = 0.85f)` accent) so it does not overwhelm the primary row actions.
-- **Cache Size Typography**: Material 3 `labelSmall` with `TextSecondary` directly below the app title, maintaining a neat 2-line layout without increasing overall row height unnecessarily.
+- **Visual Fidelity**: Identical to current app design. The icons displayed for the primary power button, whitelist shields, accessibility prompt, cache bin buttons, and status indicators will use the exact official Google Material vector paths.
+- **Icon Replacements**:
+  1. `ic_power_settings.xml`: Replaces `Icons.Default.PowerSettingsNew` in the top app bar and "Stop Selected Apps" button.
+  2. `ic_shield.xml`: Replaces `Icons.Default.Shield` in whitelist badges and empty states.
+  3. `ic_accessibility_new.xml`: Replaces `Icons.Default.AccessibilityNew` in permission dialog.
+  4. `ic_pause.xml`: Replaces `Icons.Default.Pause` in the automation HUD overlay.
+  5. `ic_check_circle.xml`: Replaces `Icons.Default.CheckCircle` in service status chips.
+  6. `ic_android.xml`: Replaces `Icons.Default.Android` for fallback app icon rendering.
+  7. `ic_delete_outline.xml`: Replaces `Icons.Outlined.Delete` for the clear cache bin icon.
 
 ---
 
 ## 3. Key Product Decisions & Trade-Offs
 
-- **Decision 1: Dedicated `CacheCleanerAutomationManager.kt` vs. Modifying `AutomationManager.kt`**
-  - *Chosen Approach*: Create a separate `CacheCleanerAutomationManager` file.
-  - *Why*: The existing `AutomationManager` is a stateful queue runner designed for bulk force-stop operations with pause/resume HUD, multiple attempts, and task reordering. Single-app cache clearing is an on-demand, targeted two-step navigation action. Separating it keeps both managers focused, maintainable, and DRY.
-- **Decision 2: Dual OEM Heuristics (Pixel vs. Samsung OneUI)**
-  - *Chosen Approach*: Search for `"Storage and cache"` first (Pixel), fallback to `"Storage"` (Samsung OneUI), followed by common resource ID matchers (`*storage*`). Once in the storage window, target `"Clear cache"` (and resource ID `*clear_cache*`).
-  - *Why*: Eliminates OEM fragmentation errors without hardcoding device models.
-- **Decision 3: Asynchronous Cache Size Loading**
-  - *Chosen Approach*: Query `StorageStatsManager.queryStatsForPackage()` in background coroutines on `Dispatchers.IO`, caching results in memory and updating `AppInfoItem.cacheSizeBytes`.
-  - *Why*: Storage stats queries can take 20-50ms per package. Offloading to background coroutines prevents any frame drops or list stuttering.
+- **Decision 1: Local XML Vector Drawables vs. `material-icons-extended`**
+  - *Chosen Approach*: Define lightweight XML vector drawables in `res/drawable/` and access them via `painterResource(R.drawable.ic_...)`.
+  - *Why*: Eliminates the ~14 MB DEX overhead of 10,000 unused classes while maintaining infinite-resolution SVG scaling.
+  - *Alternatives Considered*: Retaining the dependency and relying solely on R8 minify. *Trade-off*: Debug APKs and intermediate builds still suffer massive compile times and huge file sizes, whereas removing the library fixes both debug and release artifacts permanently.
+- **Decision 2: Remove Unused Firebase Platform BOM**
+  - *Chosen Approach*: Remove `implementation(platform(libs.firebase.bom))` from `app/build.gradle.kts`.
+  - *Why*: Stop it does not use Firebase Auth or Firestore; it runs fully local using Room. Removing the unused BOM declaration prevents Gradle from pulling extraneous metadata and compiler checks.
+- **Decision 3: Service & Resource File Audit**
+  - *Chosen Approach*: Review `ForceStopAccessibilityService.kt`, `CacheCleanerAutomationManager.kt`, and `strings.xml`. Ensure zero orphaned imports, clean up commented-out template references, and verify efficient memory management.
+  - *Why*: Ensures the codebase remains pristine, DRY, and fast.
 
 ---
 
-## 4. Technical Architecture & Data Strategy
+## 4. Technical Architecture & Implementation Steps
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                       Cache Cleaner & Storage Flow                          │
+│                       APK Size Optimization Pipeline                        │
 │                                                                             │
-│  UI Layer (Compose)                                                         │
-│  ┌───────────────────────┐         ┌──────────────────────────────────────┐ │
-│  │ AppRowItem            │         │ WhitelistRowItem                     │ │
-│  │ [Icon] [Name + Cache] │         │ [Icon] [Name + Cache]                │ │
-│  │ [Bin Icon] [Checkbox] │         │ [Bin Icon]    [Switch]               │ │
-│  └───────────┬───────────┘         └──────────────────┬───────────────────┘ │
-│              │ onClearCacheClick                      │ onClearCacheClick   │
-│              ▼                                        ▼                     │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ MainViewModel                                                          │ │
-│  │ - clearAppCache(packageName)                                           │ │
-│  │ - checkUsageAccessAndLoadCacheSizes()                                  │ │
-│  └───────────────────────────────────┬────────────────────────────────────┘ │
-│                                      │                                      │
-│  Automation & Service Layer          ▼                                      │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ CacheCleanerAutomationManager (New File)                               │ │
-│  │ 1. Opens Settings.ACTION_APPLICATION_DETAILS_SETTINGS                  │ │
-│  │ 2. Wakes ForceStopAccessibilityService                                 │ │
-│  │ 3. Step 1: Scan for "Storage and cache" / "Storage" -> Click           │ │
-│  │ 4. Step 2: Scan for "Clear cache" button -> Click                      │ │
-│  │ 5. Remains on settings page & puts service to sleep                    │ │
-│  └───────────────────────────────────┬────────────────────────────────────┘ │
-│                                      │                                      │
-│  Storage Stats Layer                 ▼                                      │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ StorageStatsHelper / AppRepository                                     │ │
-│  │ - Checks AppOpsManager.OPSTR_GET_USAGE_STATS                           │ │
-│  │ - StorageStatsManager.queryStatsForPackage() on Dispatchers.IO         │ │
-│  │ - Formats bytes to KB/MB (e.g. Formatter.formatFileSize)               │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
+│  BEFORE OPTIMIZATION (~17 MB)                                               │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ classes.dex (44 MB) + classes9.dex (11 MB) = 9 DEX Files              │  │
+│  │  - compose.material.icons.extended (10,000+ unused icon classes)      │  │
+│  │  - firebase.bom metadata declarations                                 │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+│                                   ▼                                         │
+│                                                                             │
+│  STEP 1: Bundle 7 Vector Drawables in res/drawable/ (< 15 KB total)         │
+│  - ic_power_settings.xml                                                    │
+│  - ic_shield.xml                                                            │
+│  - ic_accessibility_new.xml                                                 │
+│  - ic_pause.xml                                                             │
+│  - ic_check_circle.xml                                                      │
+│  - ic_android.xml                                                           │
+│  - ic_delete_outline.xml                                                    │
+│                                                                             │
+│                                   ▼                                         │
+│                                                                             │
+│  STEP 2: Update Composables to use painterResource()                        │
+│  - HomeScreen.kt, WhitelistRowItem.kt, AppRowItem.kt                        │
+│  - AutomationOverlayHud.kt, AccessibilityDialog.kt, AddAppsDialog.kt        │
+│                                                                             │
+│                                   ▼                                         │
+│                                                                             │
+│  STEP 3: Remove Bloated Dependencies from app/build.gradle.kts              │
+│  - Remove libs.androidx.compose.material.icons.extended                     │
+│  - Remove libs.firebase.bom                                                 │
+│                                                                             │
+│                                   ▼                                         │
+│                                                                             │
+│  AFTER OPTIMIZATION (~2–3 MB APK)                                           │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ 1-2 compact DEX files, fast launch, zero bloat, ~85% size reduction   │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Components & Responsibilities
+### Verification & Validation Plan
 
-1. **`AndroidManifest.xml`**:
-   - Add `<uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />`.
-2. **`CacheCleanerAutomationManager.kt`**:
-   - Manages state, launch coroutines, and step sequencing (Step 1: Open Details -> Step 2: Click Storage -> Step 3: Click Clear Cache).
-   - Safe timeouts (3000ms max per step) and clean resource recycling.
-3. **`ForceStopAccessibilityService.kt`**:
-   - Exposes `clickStorageNode(root)` and `clickClearCacheNode(root)` with node recycling and fallback gesture taps.
-4. **`AppInfoItem.kt`**:
-   - Adds `val cacheSizeBytes: Long? = null` and helper `formattedCacheSize: String?`.
-5. **`AppRepository.kt` & `MainViewModel.kt`**:
-   - Batch-fetches cache stats in background when Usage Access is granted.
-   - Provides `hasUsageAccessPermission()` and `openUsageAccessSettings()`.
-6. **`AppRowItem.kt` & `WhitelistRowItem.kt`**:
-   - Adds bin icon button with proper test tags (`app_clear_cache_<pkg>` and `whitelist_clear_cache_<pkg>`).
-   - Renders cache size text when available.
-
----
-
-## 5. Technical Verification & Testing
-
-1. **Compilation Check**: Run `compile_applet` to verify all imports, permissions, and Compose layouts compile cleanly.
-2. **Unit Tests**: Run `gradle :app:testDebugUnitTest` to ensure all existing unit tests pass without regression.
-3. **Automation Heuristics Verification**: Verify that both Pixel ("Storage and cache") and Samsung OneUI ("Storage") node labels are matched case-insensitively, and that "Clear cache" is clicked accurately.
-4. **Permission & Fallback Verification**: Verify that when Usage Access is absent, the app continues to operate without crashes and gracefully displays sizes once granted.
+1. **Compilation Check**: Run `compile_applet` to ensure all vector drawables compile cleanly and all Compose icons render with `painterResource`.
+2. **Automated Unit Tests**: Execute `gradle :app:testDebugUnitTest` to guarantee all existing test cases pass without regressions.
+3. **APK Size Verification**: Run `ls -lh .build-outputs/app-debug.apk` and inspect uncompressed DEX files to verify the expected ~85% reduction.

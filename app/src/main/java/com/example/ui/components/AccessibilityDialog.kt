@@ -13,8 +13,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccessibilityNew
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -63,7 +62,7 @@ fun AccessibilityDialog(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Default.AccessibilityNew,
+                    painter = painterResource(R.drawable.ic_accessibility_new),
                     contentDescription = null,
                     tint = EmeraldPrimary,
                     modifier = Modifier.size(32.dp)

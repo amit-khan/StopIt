@@ -1,6 +1,6 @@
 {
-  "summary":  "Architectural blueprint and implementation plan for the App Cache Data Cleaner feature in Stop it. Details the dedicated CacheCleanerAutomationManager, AccessibilityService two-step navigation heuristics (Pixel 'Storage and cache' vs Samsung OneUI 'Storage', and 'Clear cache' button clicks), Usage Access (PACKAGE_USAGE_STATS) permission integration for reading real cache sizes, and UI integration of bin icons on Running and Whitelist app rows.",
-  "updatedAt":  "2026-11-08T18:29:38.268413392Z",
+  "summary":  "Implementation plan for trimming the Stop it APK from ~17 MB down to ~2-3 MB by removing unused dependencies (notably the material-icons-extended library), replacing the few non-core icons with lightweight local vector drawables, removing unused Firebase BOM declarations, and pruning unneeded assets while maintaining 100% core functionality.",
+  "updatedAt":  "2026-11-09T15:25:57.671525485Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

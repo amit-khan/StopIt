@@ -25,9 +25,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Stop
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -184,7 +184,7 @@ fun AutomationOverlayHud(
                             shape = RoundedCornerShape(10.dp)
                         ) {
                             Icon(
-                                imageVector = if (progress.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                painter = if (progress.isPaused) rememberVectorPainter(Icons.Default.PlayArrow) else painterResource(R.drawable.ic_pause),
                                 contentDescription = if (progress.isPaused) stringResource(R.string.resume) else stringResource(R.string.pause),
                                 modifier = Modifier.size(18.dp)
                             )

@@ -18,9 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Android
-import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.Icon
@@ -36,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -117,7 +115,7 @@ fun AppRowItem(
                         )
                     } else {
                         Icon(
-                            imageVector = Icons.Default.Android,
+                            painter = painterResource(R.drawable.ic_android),
                             contentDescription = stringResource(R.string.app_settings_hint),
                             tint = EmeraldPrimary,
                             modifier = Modifier.size(24.dp)
@@ -171,7 +169,7 @@ fun AppRowItem(
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
-                        imageVector = Icons.Outlined.Delete,
+                        painter = painterResource(R.drawable.ic_delete_outline),
                         contentDescription = stringResource(R.string.clear_cache_hint, app.appName),
                         tint = TextSecondary,
                         modifier = Modifier.size(20.dp)
