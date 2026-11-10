@@ -7,7 +7,6 @@ import android.provider.Settings
 import com.example.MainActivity
 import com.example.data.model.AppInfoItem
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -43,134 +42,124 @@ object AutomationManager {
     private val _progress = MutableStateFlow<AutomationProgress>(AutomationProgress.Idle)
     val progress: StateFlow<AutomationProgress> = _progress.asStateFlow()
 
+    private var queue: List<AppInfoItem> = emptyList()
+    private var currentIndex = 0
+    private var stoppedCount = 0
+
     fun startAutomation(activityContext: Context, appsToStop: List<AppInfoItem>, onComplete: () -> Unit) {
         if (appsToStop.isEmpty()) return
         // Never keep an Activity alive from the long-lived automation job
         val context = activityContext.applicationContext
         stopAutomation(context)
 
+        queue = appsToStop
+        currentIndex = 0
+        stoppedCount = 0
         _isPaused.value = false
 
         // Wake the AccessibilityService from low-memory sleep mode
         ForceStopAccessibilityService.instance?.wakeForAutomation()
 
-        // Local snapshot: the job owns its queue, so nothing lingers in the singleton afterwards
-        // and a cancelled previous job can never observe a newer run's queue.
-        val queue = appsToStop.toList()
-        var stoppedCount = 0
+        automationJob = scope.launch(Dispatchers.Default) {
+            for (i in queue.indices) {
+                currentIndex = i
+                val app = queue[i]
+                _currentAppPackage.value = app.packageName
 
-        val job = scope.launch(Dispatchers.Default, start = CoroutineStart.LAZY) {
-            try {
-                for (i in queue.indices) {
-                    val app = queue[i]
-                    _currentAppPackage.value = app.packageName
+                _progress.value = AutomationProgress.Running(
+                    currentApp = app,
+                    currentIndex = i + 1,
+                    totalCount = queue.size,
+                    isPaused = _isPaused.value
+                )
 
-                    _progress.value = AutomationProgress.Running(
-                        currentApp = app,
-                        currentIndex = i + 1,
-                        totalCount = queue.size,
-                        isPaused = _isPaused.value
-                    )
+                // Wait if paused
+                _isPaused.first { !it }
 
-                    // Wait if paused
-                    _isPaused.first { !it }
+                // Open App Info settings for the target app
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    openAppDetailsSettings(context, app.packageName)
+                }
 
-                    // Open App Info settings for the target app
-                    kotlinx.coroutines.withContext(Dispatchers.Main) {
-                        openAppDetailsSettings(context, app.packageName)
-                    }
+                // Allow up to 3 attempts to force-stop the app if it refuses to stop
+                val maxAttempts = 3
+                var currentAttempt = 1
+                var appIsStopped = false
 
-                    // Allow up to 3 attempts to force-stop the app if it refuses to stop
-                    val maxAttempts = 3
-                    var currentAttempt = 1
-                    var appIsStopped = false
+                while (currentAttempt <= maxAttempts && !appIsStopped) {
+                    var waitElapsed = 0L
+                    val timeoutMs = 3500L
+                    val stepDelay = 80L
 
-                    while (currentAttempt <= maxAttempts && !appIsStopped) {
-                        var waitElapsed = 0L
-                        val timeoutMs = 3500L
-                        val stepDelay = 80L
+                    while (waitElapsed < timeoutMs && !appIsStopped) {
+                        _isPaused.first { !it }
 
-                        while (waitElapsed < timeoutMs && !appIsStopped) {
-                            _isPaused.first { !it }
+                        val service = ForceStopAccessibilityService.instance
+                        if (service != null) {
+                            // Check if button is already disabled or app is already stopped
+                            if (service.isForceStopDisabled() || isPackageStopped(context, app.packageName)) {
+                                appIsStopped = true
+                                break
+                            }
 
-                            val service = ForceStopAccessibilityService.instance
-                            if (service != null) {
-                                // Check if button is already disabled or app is already stopped
-                                if (isPackageStopped(context, app.packageName) || service.isForceStopDisabled()) {
+                            val result = service.scanAndExecute(app.packageName)
+                            when (result) {
+                                ForceStopActionResult.ALREADY_DISABLED -> {
                                     appIsStopped = true
                                     break
                                 }
+                                ForceStopActionResult.CONFIRMATION_CLICKED -> {
+                                    // Small delay between clicking OK and checking "Force stop" button's state,
+                                    // to ensure the new state is properly applied on settings page and read by the service.
+                                    delay(250)
 
-                                val result = service.scanAndExecute(app.packageName)
-                                when (result) {
-                                    ForceStopActionResult.ALREADY_DISABLED -> {
+                                    // Verify that the Force Stop button is now disabled or app is actually stopped
+                                    if (service.isForceStopDisabled() || isPackageStopped(context, app.packageName)) {
                                         appIsStopped = true
                                         break
-                                    }
-                                    ForceStopActionResult.CONFIRMATION_CLICKED -> {
-                                        // Small delay between clicking OK and checking "Force stop" button's state,
-                                        // to ensure the new state is properly applied on settings page and read by the service.
-                                        delay(250)
-
-                                        // Verify that the Force Stop button is now disabled or app is actually stopped
-                                        if (isPackageStopped(context, app.packageName) || service.isForceStopDisabled()) {
-                                            appIsStopped = true
-                                            break
-                                        } else {
-                                            // Still active after this attempt! Break out of inner scan loop to trigger attempt 2 or 3
-                                            break
-                                        }
-                                    }
-                                    ForceStopActionResult.FORCE_STOP_CLICKED -> {
-                                        // Button was clicked, dialog is expected shortly
-                                    }
-                                    ForceStopActionResult.NONE -> {
-                                        // Window or dialog not yet ready
+                                    } else {
+                                        // Still active after this attempt! Break out of inner scan loop to trigger attempt 2 or 3
+                                        break
                                     }
                                 }
-                            }
-
-                            delay(stepDelay)
-                            waitElapsed += stepDelay
-                        }
-
-                        if (!appIsStopped) {
-                            currentAttempt++
-                            if (currentAttempt <= maxAttempts) {
-                                delay(200) // Small delay before next attempt
+                                ForceStopActionResult.FORCE_STOP_CLICKED -> {
+                                    // Button was clicked, dialog is expected shortly
+                                }
+                                ForceStopActionResult.NONE -> {
+                                    // Window or dialog not yet ready
+                                }
                             }
                         }
+
+                        delay(stepDelay)
+                        waitElapsed += stepDelay
                     }
 
-                    if (appIsStopped) stoppedCount++
-                    _currentAppPackage.value = null
-                    delay(200) // Small breathing room between apps
+                    if (!appIsStopped) {
+                        currentAttempt++
+                        if (currentAttempt <= maxAttempts) {
+                            delay(200) // Small delay before next attempt
+                        }
+                    }
                 }
 
-                // Put the AccessibilityService back to low-memory sleep mode immediately
-                ForceStopAccessibilityService.instance?.sleepService()
-
-                // Bring Stop it back to the foreground
-                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    bringAppToForeground(context)
-                    onComplete()
-                }
-
-                _progress.value = AutomationProgress.Completed(stoppedCount)
+                if (appIsStopped) stoppedCount++
                 _currentAppPackage.value = null
-            } finally {
-                // Whatever ended the run (completion, error), make sure the service is idle again.
-                // A cancelled run was already cleaned up by stopAutomation(); skip it so a stale job
-                // can't put a newer run's service to sleep.
-                if (automationJob === coroutineContext[Job]) {
-                    automationJob = null
-                    _currentAppPackage.value = null
-                    ForceStopAccessibilityService.instance?.sleepService()
-                }
+                delay(200) // Small breathing room between apps
             }
+
+            // Put the AccessibilityService back to low-memory sleep mode immediately
+            ForceStopAccessibilityService.instance?.sleepService()
+
+            // Bring Stop it back to the foreground
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                bringAppToForeground(context)
+                onComplete()
+            }
+
+            _progress.value = AutomationProgress.Completed(stoppedCount)
+            _currentAppPackage.value = null
         }
-        automationJob = job
-        job.start()
     }
 
     fun togglePause() {
