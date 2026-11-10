@@ -34,7 +34,7 @@ object CacheCleanerAutomationManager {
         activeJob = scope.launch(Dispatchers.IO) {
             // 1. Wake accessibility service for automation. Not restricted to the Settings package
             // because some OEMs host the storage page in their own security/safe-center app.
-            ForceStopAccessibilityService.instance?.wakeForAutomation(restrictToSettings = false)
+            ForceStopAccessibilityService.instance?.wakeForAutomation()
 
             // 2. Open App Info settings for the target app
             withContext(Dispatchers.Main) {

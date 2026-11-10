@@ -5,14 +5,14 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Path
 import android.graphics.Rect
-import android.net.Uri
 import android.provider.Settings
 import android.text.TextUtils
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import com.example.BuildConfig
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -59,13 +59,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
     @Volatile
     private var automationActive = false
 
-    /** Packages whose windows may be inspected; null means "no restriction". */
-    @Volatile
-    private var allowedPackages: Set<String>? = null
-
-    private var settingsPackagesResolved = false
-    private var resolvedSettingsPackages: Set<String>? = null
-
     override fun onServiceConnected() {
         super.onServiceConnected()
         _isServiceActive.value = true
@@ -84,15 +77,13 @@ class ForceStopAccessibilityService : AccessibilityService() {
     /**
      * Awakens the service when automation begins.
      *
-     * @param restrictToSettings when true, the system only delivers events from the Settings
-     * package and only Settings windows are scanned. Cache cleaning disables this because some
-     * OEMs (Xiaomi, OnePlus/Oppo) host the storage page in a different package.
+     * Events are NOT filtered by package: OEM builds (Samsung One UI in particular) can host the
+     * App Info page and its dialogs in packages we cannot reliably predict, and a wrong guess
+     * silently disables the whole automation. Scanning is already cheap because events only
+     * raise a signal and our own/SystemUI windows are skipped.
      */
-    fun wakeForAutomation(restrictToSettings: Boolean = true) {
+    fun wakeForAutomation() {
         try {
-            val allowed = if (restrictToSettings) resolveSettingsPackages() else null
-            allowedPackages = allowed
-
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -100,7 +91,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
             info.flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
             info.notificationTimeout = EVENT_NOTIFICATION_TIMEOUT_MS
-            info.packageNames = allowed?.toTypedArray()
+            info.packageNames = null
             serviceInfo = info
             automationActive = true
         } catch (ignored: Exception) {}
@@ -112,7 +103,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
      */
     fun sleepService() {
         automationActive = false
-        allowedPackages = null
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = 0
@@ -126,23 +116,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
         // Intentionally cheap: do NOT touch event.source or scan here.
         if (!automationActive) return
         notifyChange()
-    }
-
-    private fun resolveSettingsPackages(): Set<String>? {
-        if (settingsPackagesResolved) return resolvedSettingsPackages
-        val resolved = try {
-            val intent = Intent(
-                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                Uri.fromParts("package", packageName, null)
-            )
-            packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                ?.activityInfo?.packageName
-        } catch (e: Exception) {
-            null
-        }
-        resolvedSettingsPackages = if (resolved.isNullOrEmpty()) null else setOf(resolved) + KNOWN_SETTINGS_PACKAGES
-        settingsPackagesResolved = true
-        return resolvedSettingsPackages
     }
 
     // ---------------------------------------------------------------------------------------
@@ -178,7 +151,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
      */
     fun scanAndExecute(@Suppress("UNUSED_PARAMETER") targetPackage: String): ForceStopActionResult {
         val roots = getRelevantRoots()
-        if (roots.isEmpty()) return ForceStopActionResult.NONE
+        if (roots.isEmpty()) {
+            debugLog("force-stop scan: no relevant windows")
+            return ForceStopActionResult.NONE
+        }
 
         val snapshots = ArrayList<ForceStopSnapshot>(roots.size)
         try {
@@ -190,6 +166,15 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     inspectForceStop(root, snap)
                     if (tryClickPositive(snap)) return ForceStopActionResult.CONFIRMATION_CLICKED
                 } catch (ignored: Exception) {}
+            }
+
+            if (BuildConfig.DEBUG) {
+                debugLog(
+                    "force-stop scan: roots=" + roots.joinToString { it.packageName.toString() } +
+                        " dialog=" + snapshots.any { it.dialogPresent } +
+                        " forceStopFound=" + snapshots.any { it.forceStop != null } +
+                        " candidates=" + snapshots.sumOf { it.candidates.size }
+                )
             }
 
             // PHASE 2: a dialog is on screen -> do not touch the background window.
@@ -208,6 +193,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
             snapshots.forEach { it.release() }
             roots.forEach { safeRecycle(it) }
         }
+    }
+
+    private fun debugLog(message: String) {
+        if (BuildConfig.DEBUG) Log.d(TAG, message)
     }
 
     private class QueuedNode(val node: AccessibilityNodeInfo, val depth: Int)
@@ -550,9 +539,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     private fun isRelevantRoot(root: AccessibilityNodeInfo): Boolean {
         val pkg = root.packageName?.toString() ?: return false
-        if (pkg == packageName || pkg == "com.android.systemui") return false
-        val allowed = allowedPackages
-        return allowed == null || allowed.contains(pkg)
+        return pkg != packageName && pkg != "com.android.systemui"
     }
 
     private fun enqueueChildren(node: AccessibilityNodeInfo, depth: Int, queue: ArrayDeque<QueuedNode>) {
@@ -702,6 +689,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val TAG = "StopItService"
         private const val EVENT_NOTIFICATION_TIMEOUT_MS = 150L
         private const val MAX_FORCE_STOP_DEPTH = 3
         private const val MAX_FORCE_STOP_QUEUE = 25
@@ -778,12 +766,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
             }
             return false
         }
-
-        private val KNOWN_SETTINGS_PACKAGES = setOf(
-            "com.android.settings",
-            "com.google.android.settings",
-            "com.samsung.android.settings"
-        )
 
         private val POSITIVE_ID_NAMES = listOf("button1", "ok")
         private val GLOBAL_POSITIVE_IDS = listOf("android:id/button1", "android:id/ok")

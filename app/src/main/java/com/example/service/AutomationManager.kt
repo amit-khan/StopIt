@@ -64,7 +64,7 @@ object AutomationManager {
         _isPaused.value = false
 
         // Wake the AccessibilityService from low-memory sleep mode
-        ForceStopAccessibilityService.instance?.wakeForAutomation(restrictToSettings = true)
+        ForceStopAccessibilityService.instance?.wakeForAutomation()
 
         automationJob = scope.launch(Dispatchers.IO) {
             // The system broadcasts ACTION_PACKAGE_RESTARTED when a package is force-stopped, which
