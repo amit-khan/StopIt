@@ -1,19 +1,27 @@
 package com.example.service
 
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.data.model.AppInfoItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 sealed interface AutomationProgress {
     object Idle : AutomationProgress
@@ -28,7 +36,14 @@ sealed interface AutomationProgress {
 }
 
 object AutomationManager {
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private const val MAX_ATTEMPTS = 3
+    private const val ATTEMPT_TIMEOUT_MS = 3500L
+    /** Safety net: re-scan at least this often even if no accessibility event arrives. */
+    private const val EVENT_FALLBACK_MS = 300L
+    /** How long to wait for the "package restarted" broadcast after the confirmation click. */
+    private const val CONFIRM_SETTLE_MS = 600L
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var automationJob: Job? = null
 
     private val _currentAppPackage = MutableStateFlow<String?>(null)
@@ -40,125 +55,143 @@ object AutomationManager {
     private val _progress = MutableStateFlow<AutomationProgress>(AutomationProgress.Idle)
     val progress: StateFlow<AutomationProgress> = _progress.asStateFlow()
 
-    private var queue: List<AppInfoItem> = emptyList()
-    private var currentIndex = 0
-    private var stoppedCount = 0
-
     fun startAutomation(context: Context, appsToStop: List<AppInfoItem>, onComplete: () -> Unit) {
         if (appsToStop.isEmpty()) return
-        stopAutomation(context)
+        val appContext = context.applicationContext
+        stopAutomation(appContext)
 
-        queue = appsToStop
-        currentIndex = 0
-        stoppedCount = 0
+        val queue = appsToStop.toList()
         _isPaused.value = false
 
         // Wake the AccessibilityService from low-memory sleep mode
-        ForceStopAccessibilityService.instance?.wakeForAutomation()
+        ForceStopAccessibilityService.instance?.wakeForAutomation(restrictToSettings = true)
 
-        automationJob = scope.launch(Dispatchers.Default) {
-            for (i in queue.indices) {
-                currentIndex = i
-                val app = queue[i]
-                _currentAppPackage.value = app.packageName
-
-                _progress.value = AutomationProgress.Running(
-                    currentApp = app,
-                    currentIndex = i + 1,
-                    totalCount = queue.size,
-                    isPaused = _isPaused.value
-                )
-
-                // Wait if paused
-                while (_isPaused.value) {
-                    delay(300)
+        automationJob = scope.launch(Dispatchers.IO) {
+            // The system broadcasts ACTION_PACKAGE_RESTARTED when a package is force-stopped, which
+            // lets us detect success instantly instead of polling PackageManager.
+            val stoppedPackages: MutableSet<String> = ConcurrentHashMap.newKeySet()
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, intent: Intent?) {
+                    val pkg = intent?.data?.schemeSpecificPart ?: return
+                    stoppedPackages.add(pkg)
+                    ForceStopAccessibilityService.notifyChange()
                 }
+            }
+            val registered = registerStopReceiver(appContext, receiver)
 
-                // Open App Info settings for the target app
-                kotlinx.coroutines.withContext(Dispatchers.Main) {
-                    openAppDetailsSettings(context, app.packageName)
-                }
+            var stoppedCount = 0
+            try {
+                for (i in queue.indices) {
+                    val app = queue[i]
+                    _currentAppPackage.value = app.packageName
 
-                // Allow up to 3 attempts to force-stop the app if it refuses to stop
-                val maxAttempts = 3
-                var currentAttempt = 1
-                var appIsStopped = false
+                    _progress.value = AutomationProgress.Running(
+                        currentApp = app,
+                        currentIndex = i + 1,
+                        totalCount = queue.size,
+                        isPaused = _isPaused.value
+                    )
 
-                while (currentAttempt <= maxAttempts && !appIsStopped) {
-                    var waitElapsed = 0L
-                    val timeoutMs = 3500L
-                    val stepDelay = 80L
+                    _isPaused.first { !it }
 
-                    while (waitElapsed < timeoutMs && !appIsStopped) {
-                        while (_isPaused.value) {
-                            delay(300)
-                        }
-
-                        val service = ForceStopAccessibilityService.instance
-                        if (service != null) {
-                            // Check if button is already disabled or app is already stopped
-                            if (service.isForceStopDisabled() || isPackageStopped(context, app.packageName)) {
-                                appIsStopped = true
-                                break
-                            }
-
-                            val result = service.scanAndExecute(app.packageName)
-                            when (result) {
-                                ForceStopActionResult.ALREADY_DISABLED -> {
-                                    appIsStopped = true
-                                    break
-                                }
-                                ForceStopActionResult.CONFIRMATION_CLICKED -> {
-                                    // Small delay between clicking OK and checking "Force stop" button's state,
-                                    // to ensure the new state is properly applied on settings page and read by the service.
-                                    delay(250)
-
-                                    // Verify that the Force Stop button is now disabled or app is actually stopped
-                                    if (service.isForceStopDisabled() || isPackageStopped(context, app.packageName)) {
-                                        appIsStopped = true
-                                        break
-                                    } else {
-                                        // Still active after this attempt! Break out of inner scan loop to trigger attempt 2 or 3
-                                        break
-                                    }
-                                }
-                                ForceStopActionResult.FORCE_STOP_CLICKED -> {
-                                    // Button was clicked, dialog is expected shortly
-                                }
-                                ForceStopActionResult.NONE -> {
-                                    // Window or dialog not yet ready
-                                }
-                            }
-                        }
-
-                        delay(stepDelay)
-                        waitElapsed += stepDelay
+                    if (forceStopApp(appContext, app.packageName, stoppedPackages)) {
+                        stoppedCount++
                     }
 
-                    if (!appIsStopped) {
-                        currentAttempt++
-                        if (currentAttempt <= maxAttempts) {
-                            delay(200) // Small delay before next attempt
-                        }
-                    }
+                    _currentAppPackage.value = null
+                    delay(200) // Small breathing room between apps
                 }
-
-                stoppedCount++
-                _currentAppPackage.value = null
-                delay(200) // Small breathing room between apps
+            } finally {
+                if (registered) {
+                    try { appContext.unregisterReceiver(receiver) } catch (ignored: Exception) {}
+                }
             }
 
             // Put the AccessibilityService back to low-memory sleep mode immediately
             ForceStopAccessibilityService.instance?.sleepService()
 
             // Bring Stop it back to the foreground
-            kotlinx.coroutines.withContext(Dispatchers.Main) {
-                bringAppToForeground(context)
+            withContext(Dispatchers.Main) {
+                bringAppToForeground(appContext)
                 onComplete()
             }
 
             _progress.value = AutomationProgress.Completed(stoppedCount)
             _currentAppPackage.value = null
+        }
+    }
+
+    /**
+     * Opens App Info for [packageName] and drives the Force stop flow. Returns true if the app
+     * ended up stopped. Waits on accessibility events / broadcasts instead of busy-polling.
+     */
+    private suspend fun forceStopApp(
+        context: Context,
+        packageName: String,
+        stoppedPackages: Set<String>
+    ): Boolean {
+        // Nothing to do (and no need to open Settings) if it is already stopped.
+        if (isPackageStopped(context, packageName)) return true
+
+        withContext(Dispatchers.Main) { openAppDetailsSettings(context, packageName) }
+
+        for (attempt in 1..MAX_ATTEMPTS) {
+            val deadline = SystemClock.elapsedRealtime() + ATTEMPT_TIMEOUT_MS
+
+            while (SystemClock.elapsedRealtime() < deadline) {
+                _isPaused.first { !it }
+
+                if (packageName in stoppedPackages) return true
+
+                val service = ForceStopAccessibilityService.instance
+                if (service == null) {
+                    delay(EVENT_FALLBACK_MS)
+                    continue
+                }
+
+                when (service.scanAndExecute(packageName)) {
+                    ForceStopActionResult.ALREADY_DISABLED -> return true
+                    ForceStopActionResult.CONFIRMATION_CLICKED -> {
+                        // Wait briefly for the restart broadcast, then verify the final state.
+                        waitUntil(CONFIRM_SETTLE_MS) { packageName in stoppedPackages }
+                        if (packageName in stoppedPackages ||
+                            service.isForceStopDisabled() ||
+                            isPackageStopped(context, packageName)
+                        ) {
+                            return true
+                        }
+                        break // still active: go to the next attempt
+                    }
+                    ForceStopActionResult.FORCE_STOP_CLICKED,
+                    ForceStopActionResult.NONE -> Unit
+                }
+
+                // Sleep until the UI changes (or the fallback interval elapses).
+                ForceStopAccessibilityService.awaitChange(EVENT_FALLBACK_MS)
+            }
+
+            if (attempt < MAX_ATTEMPTS) delay(200) // Small delay before next attempt
+        }
+        return false
+    }
+
+    private suspend fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
+        val end = SystemClock.elapsedRealtime() + timeoutMs
+        while (!condition()) {
+            val remaining = end - SystemClock.elapsedRealtime()
+            if (remaining <= 0) return false
+            ForceStopAccessibilityService.awaitChange(remaining)
+        }
+        return true
+    }
+
+    private fun registerStopReceiver(context: Context, receiver: BroadcastReceiver): Boolean {
+        return try {
+            val filter = IntentFilter(Intent.ACTION_PACKAGE_RESTARTED).apply { addDataScheme("package") }
+            ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            true
+        } catch (e: Exception) {
+            false // Falls back to PackageManager / button-state checks.
         }
     }
 
@@ -178,16 +211,12 @@ object AutomationManager {
         _isPaused.value = false
         _progress.value = AutomationProgress.Cancelled
         ForceStopAccessibilityService.instance?.sleepService()
-        bringAppToForeground(context)
+        bringAppToForeground(context.applicationContext)
     }
 
     fun resetProgress() {
         _progress.value = AutomationProgress.Idle
     }
-
-    fun notifyForceStopClicked(packageName: String) {}
-
-    fun notifyAppStopped(packageName: String) {}
 
     private fun isPackageStopped(context: Context, packageName: String): Boolean {
         return try {

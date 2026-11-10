@@ -5,16 +5,21 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Path
 import android.graphics.Rect
+import android.net.Uri
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeoutOrNull
 import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 
 enum class ForceStopActionResult {
     NONE,
@@ -30,7 +35,36 @@ enum class ClearCacheActionResult {
     ALREADY_CLEARED
 }
 
+/**
+ * Accessibility service used to drive the system Settings UI.
+ *
+ * Performance design:
+ *  - The service is idle by default (no event types, no window flags). It is only "woken"
+ *    for the duration of an automation run.
+ *  - Events never trigger scans themselves; they only raise a conflated signal that the
+ *    automation coroutine waits on (see [awaitChange]). All scanning happens on that single
+ *    coroutine, never on the main thread, and never concurrently.
+ *  - Only windows belonging to the Settings package are inspected (SystemUI, IME and our own
+ *    window are skipped), and when possible the system itself filters events by package.
+ *  - Each force-stop tick is a single pass per window instead of several overlapping ones.
+ *  - Resource-ID / text lookups try the previously successful key first and only query
+ *    IDs that make sense for the window's package.
+ */
+private fun safeRecycle(node: AccessibilityNodeInfo) {
+    try { node.recycle() } catch (ignored: Exception) {}
+}
+
 class ForceStopAccessibilityService : AccessibilityService() {
+
+    @Volatile
+    private var automationActive = false
+
+    /** Packages whose windows may be inspected; null means "no restriction". */
+    @Volatile
+    private var allowedPackages: Set<String>? = null
+
+    private var settingsPackagesResolved = false
+    private var resolvedSettingsPackages: Set<String>? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -48,505 +82,293 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Awakens the service when automation begins:
-     * Restricts event filtering strictly to window state and window content changes.
-     * Does NOT include FLAG_INCLUDE_NOT_IMPORTANT_VIEWS to keep node allocations minimal.
+     * Awakens the service when automation begins.
+     *
+     * @param restrictToSettings when true, the system only delivers events from the Settings
+     * package and only Settings windows are scanned. Cache cleaning disables this because some
+     * OEMs (Xiaomi, OnePlus/Oppo) host the storage page in a different package.
      */
-    fun wakeForAutomation() {
+    fun wakeForAutomation(restrictToSettings: Boolean = true) {
         try {
+            val allowed = if (restrictToSettings) resolveSettingsPackages() else null
+            allowedPackages = allowed
+
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
             info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             info.flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
-            info.notificationTimeout = 100
+            info.notificationTimeout = EVENT_NOTIFICATION_TIMEOUT_MS
+            info.packageNames = allowed?.toTypedArray()
             serviceInfo = info
+            automationActive = true
         } catch (ignored: Exception) {}
     }
 
     /**
-     * Puts the service into low-memory sleep mode when idle:
-     * Disables event delivery (eventTypes = 0) so the OS stops sending window events.
+     * Puts the service into low-memory sleep mode when idle: no events are delivered and the
+     * window-tracking flags are cleared so the system does no work on our behalf.
      */
     fun sleepService() {
+        automationActive = false
+        allowedPackages = null
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = 0
+            info.flags = 0
+            info.packageNames = null
             serviceInfo = info
         } catch (ignored: Exception) {}
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        val currentAutomatingApp = AutomationManager.currentAppPackage.value ?: return
-        if (AutomationManager.isPaused.value) return
-
-        // Transiently inspect event source without caching it in long-lived state
-        val source = try { event.source } catch (e: Exception) { null }
-        scanAndExecute(currentAutomatingApp, source)
+        // Intentionally cheap: do NOT touch event.source or scan here.
+        if (!automationActive) return
+        notifyChange()
     }
+
+    private fun resolveSettingsPackages(): Set<String>? {
+        if (settingsPackagesResolved) return resolvedSettingsPackages
+        val resolved = try {
+            val intent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", packageName, null)
+            )
+            packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+                ?.activityInfo?.packageName
+        } catch (e: Exception) {
+            null
+        }
+        resolvedSettingsPackages = if (resolved.isNullOrEmpty()) null else setOf(resolved) + KNOWN_SETTINGS_PACKAGES
+        settingsPackagesResolved = true
+        return resolvedSettingsPackages
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Force stop
+    // ---------------------------------------------------------------------------------------
 
     /**
      * Checks if the "Force stop" button on the current App Info page is disabled,
      * indicating that the app is now force-stopped.
      */
     fun isForceStopDisabled(): Boolean {
-        val roots = getAllActiveRootNodes(null)
-        if (roots.isEmpty()) return false
-
+        val roots = getRelevantRoots()
         try {
             for (root in roots) {
-                val node = findForceStopButtonNode(root)
-                if (node != null) {
-                    val disabled = !node.isEnabled
-                    try { node.recycle() } catch (ignored: Exception) {}
-                    if (disabled) {
-                        return true
-                    }
+                val node = (try { findForceStopNode(root) } catch (e: Exception) { null }) ?: continue
+                try {
+                    if (!node.isEnabled) return true
+                } finally {
+                    safeRecycle(node)
                 }
             }
             return false
         } finally {
-            for (root in roots) {
-                try { root.recycle() } catch (ignored: Exception) {}
-            }
+            roots.forEach { safeRecycle(it) }
         }
     }
 
     /**
-     * Actively scans window hierarchies with guaranteed recycling:
-     * 1. If confirmation dialog is visible -> Clicks positive button ("OK" / "Force stop" / button1 / gesture)
-     * 2. If a dialog is on screen but not yet clicked -> WAITS (blocks touching background button)
-     * 3. If NO dialog is present -> Finds and clicks "Force stop" button on App Info page
-     *
-     * Returns ForceStopActionResult indicating exact action taken for multi-attempt handling.
+     * One pass over the relevant windows:
+     * 1. If a confirmation dialog is visible -> click its positive button.
+     * 2. If a dialog is on screen but nothing could be clicked -> WAIT (never touch the background page).
+     * 3. If NO dialog is present -> find and click "Force stop" on the App Info page.
      */
-    fun scanAndExecute(targetPackage: String, triggerSource: AccessibilityNodeInfo? = null): ForceStopActionResult {
-        val roots = getAllActiveRootNodes(triggerSource)
+    fun scanAndExecute(@Suppress("UNUSED_PARAMETER") targetPackage: String): ForceStopActionResult {
+        val roots = getRelevantRoots()
         if (roots.isEmpty()) return ForceStopActionResult.NONE
 
+        val snapshots = ArrayList<ForceStopSnapshot>(roots.size)
         try {
-            // PHASE 1: Handle open confirmation dialog across all active roots FIRST!
+            // PHASE 1: inspect each window once; click a confirmation button as soon as one is found.
             for (root in roots) {
+                val snap = ForceStopSnapshot()
+                snapshots.add(snap)
                 try {
-                    if (handleConfirmationDialog(root, targetPackage)) {
-                        return ForceStopActionResult.CONFIRMATION_CLICKED
-                    }
+                    inspectForceStop(root, snap)
+                    if (tryClickPositive(snap)) return ForceStopActionResult.CONFIRMATION_CLICKED
                 } catch (ignored: Exception) {}
             }
 
-            // PHASE 2: If a confirmation dialog is detected on screen, DO NOT touch background window!
-            for (root in roots) {
+            // PHASE 2: a dialog is on screen -> do not touch the background window.
+            if (snapshots.any { it.dialogPresent }) return ForceStopActionResult.NONE
+
+            // PHASE 3: no dialog -> click Force stop (or report it is already disabled).
+            for (snap in snapshots) {
+                val node = snap.forceStop ?: continue
                 try {
-                    if (isConfirmationDialog(root)) {
-                        return ForceStopActionResult.NONE
-                    }
+                    if (!node.isEnabled) return ForceStopActionResult.ALREADY_DISABLED
+                    if (performClickWithFallback(node)) return ForceStopActionResult.FORCE_STOP_CLICKED
                 } catch (ignored: Exception) {}
-            }
-
-            // PHASE 3: Only when NO dialog is on screen, search for and click Force Stop button in App Info
-            for (root in roots) {
-                try {
-                    val result = handleForceStopButton(root, targetPackage)
-                    if (result != ForceStopActionResult.NONE) {
-                        return result
-                    }
-                } catch (ignored: Exception) {}
-            }
-
-            return ForceStopActionResult.NONE
-        } finally {
-            // Guarantee immediate recycling of every root node
-            for (root in roots) {
-                try {
-                    root.recycle()
-                } catch (ignored: Exception) {}
-            }
-        }
-    }
-
-    /**
-     * Scans for and executes Clear Cache workflow:
-     * 1. Priority 1: If "Clear cache" button is visible -> Click it (or detect if already disabled/cleared).
-     * 2. Priority 2: If a confirmation dialog is visible -> Click "OK" / "Clear cache".
-     * 3. Priority 3: If on App Info page -> Find and click "Storage" / "Storage and cache" / "Storage usage" across OEMs.
-     */
-    fun scanAndExecuteClearCache(): ClearCacheActionResult {
-        val roots = getAllActiveRootNodes(null)
-        if (roots.isEmpty()) return ClearCacheActionResult.NONE
-
-        try {
-            // 1. Check if "Clear cache" button is already present on the storage page
-            for (root in roots) {
-                val clearCacheNode = findClearCacheButtonNode(root)
-                if (clearCacheNode != null) {
-                    try {
-                        if (!clearCacheNode.isEnabled) {
-                            return ClearCacheActionResult.ALREADY_CLEARED
-                        }
-                        if (performClickWithFallback(clearCacheNode)) {
-                            return ClearCacheActionResult.CLEAR_CACHE_CLICKED
-                        }
-                    } finally {
-                        try { clearCacheNode.recycle() } catch (ignored: Exception) {}
-                    }
-                }
-            }
-
-            // 2. Check if a confirmation dialog is visible (e.g. Xiaomi / OEM dialog asking "Clear cache?")
-            for (root in roots) {
-                val confirmNode = findDialogConfirmNode(root)
-                if (confirmNode != null) {
-                    try {
-                        if (performClickWithFallback(confirmNode)) {
-                            return ClearCacheActionResult.CLEAR_CACHE_CLICKED
-                        }
-                    } finally {
-                        try { confirmNode.recycle() } catch (ignored: Exception) {}
-                    }
-                }
-            }
-
-            // 3. On App Info page, find and click "Storage" / "Storage and cache" / "Storage usage"
-            for (root in roots) {
-                val storageNode = findStorageNode(root)
-                if (storageNode != null) {
-                    try {
-                        if (performClickWithFallback(storageNode)) {
-                            return ClearCacheActionResult.STORAGE_CLICKED
-                        }
-                    } finally {
-                        try { storageNode.recycle() } catch (ignored: Exception) {}
-                    }
-                }
-            }
-
-            return ClearCacheActionResult.NONE
-        } finally {
-            for (root in roots) {
-                try { root.recycle() } catch (ignored: Exception) {}
-            }
-        }
-    }
-
-    private fun getAllActiveRootNodes(triggerSource: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
-        val list = mutableListOf<AccessibilityNodeInfo>()
-
-        // 1. Add triggerSource if provided
-        if (triggerSource != null) {
-            list.add(triggerSource)
-        }
-
-        // 2. Inspect all interactive windows in reverse order (topmost / newest dialog first)
-        try {
-            val windowList = windows
-            if (!windowList.isNullOrEmpty()) {
-                for (window in windowList.reversed()) {
-                    window.root?.let { node ->
-                        if (!list.contains(node)) {
-                            list.add(node)
-                        } else {
-                            try { node.recycle() } catch (ignored: Exception) {}
-                        }
-                    }
-                }
-            }
-        } catch (ignored: Exception) {}
-
-        // 3. Add rootInActiveWindow if not already in list
-        try {
-            rootInActiveWindow?.let {
-                if (!list.contains(it)) {
-                    list.add(it)
-                } else {
-                    try { it.recycle() } catch (ignored: Exception) {}
-                }
-            }
-        } catch (ignored: Exception) {}
-
-        return list
-    }
-
-    private fun isConfirmationDialog(root: AccessibilityNodeInfo): Boolean {
-        // Fast-path: targeted ID check for alert dialog titles and panels
-        val dialogIds = listOf(
-            "android:id/alertTitle",
-            "android:id/parentPanel",
-            "android:id/buttonPanel",
-            "com.android.settings:id/parentPanel"
-        )
-        for (id in dialogIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                for (node in nodes) {
-                    try { node.recycle() } catch (ignored: Exception) {}
-                }
-                return true
-            }
-        }
-
-        // Shallow traversal capped at depth 3 and max 25 nodes
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
-        }
-
-        var isDialog = false
-        while (queue.isNotEmpty()) {
-            val (node, depth) = queue.removeFirst()
-            try {
-                val text = node.text?.toString()?.lowercase().orEmpty()
-                val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
-                val viewId = node.viewIdResourceName?.lowercase().orEmpty()
-                val className = node.className?.toString().orEmpty()
-
-                if (text.contains("if you force stop") ||
-                    text.contains("may misbehave") ||
-                    text.contains("cause errors") ||
-                    text.contains("force stop?") ||
-                    text.contains("forcer l'arrêt ?") ||
-                    text.contains("¿forzar detención?") ||
-                    viewId.endsWith("alerttitle") ||
-                    viewId.endsWith("parentpanel") ||
-                    viewId.endsWith("buttonpanel") ||
-                    className.contains("dialog", ignoreCase = true)
-                ) {
-                    isDialog = true
-                    break
-                }
-
-                if (depth < 3 && queue.size < 25) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                    }
-                }
-            } finally {
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
-
-        // Recycle any remaining nodes in queue
-        while (queue.isNotEmpty()) {
-            val (node, _) = queue.removeFirst()
-            try { node.recycle() } catch (ignored: Exception) {}
-        }
-
-        return isDialog
-    }
-
-    private fun handleConfirmationDialog(root: AccessibilityNodeInfo, pkgName: String): Boolean {
-        // 1. Direct ID check for standard positive buttons
-        val positiveIds = listOf(
-            "android:id/button1",
-            "com.android.settings:id/button1",
-            "com.samsung.android.settings:id/button1",
-            "com.google.android.settings:id/button1",
-            "android:id/ok",
-            "com.android.settings:id/ok"
-        )
-        for (id in positiveIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            for (node in nodes) {
-                try {
-                    if (node.isEnabled && performClickWithFallback(node)) {
-                        for (other in nodes) {
-                            try { other.recycle() } catch (ignored: Exception) {}
-                        }
-                        return true
-                    }
-                } catch (ignored: Exception) {}
-            }
-            for (node in nodes) {
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
-
-        // 2. Shallow traversal to find positive button
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
-        }
-
-        val candidates = mutableListOf<AccessibilityNodeInfo>()
-        var hasDialogContent = false
-
-        try {
-            while (queue.isNotEmpty()) {
-                val (node, depth) = queue.removeFirst()
-                val viewId = node.viewIdResourceName?.lowercase().orEmpty()
-                val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
-                val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
-                val className = node.className?.toString().orEmpty()
-
-                if (text.contains("if you force stop") ||
-                    text.contains("may misbehave") ||
-                    text.contains("cause errors") ||
-                    text.contains("force stop?") ||
-                    viewId.contains("parentpanel") ||
-                    viewId.contains("buttonpanel") ||
-                    className.contains("dialog", ignoreCase = true)
-                ) {
-                    hasDialogContent = true
-                }
-
-                // If ID ends with button1, click it immediately
-                if ((viewId.endsWith(":id/button1") || viewId.endsWith("/button1")) && node.isEnabled) {
-                    if (performClickWithFallback(node)) {
-                        try { node.recycle() } catch (ignored: Exception) {}
-                        return true
-                    }
-                }
-
-                val isClickableOrButton = className.contains("Button", ignoreCase = true) ||
-                        className.contains("TextView", ignoreCase = true) ||
-                        node.isClickable
-                if (isClickableOrButton && (text.isNotEmpty() || desc.isNotEmpty())) {
-                    candidates.add(node)
-                } else {
-                    try { node.recycle() } catch (ignored: Exception) {}
-                }
-
-                if (depth < 3 && queue.size < 25) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                    }
-                }
-            }
-
-            // Evaluate candidates
-            for (btn in candidates) {
-                val text = btn.text?.toString()?.trim()?.lowercase().orEmpty()
-                val desc = btn.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
-                val viewId = btn.viewIdResourceName?.lowercase().orEmpty()
-
-                val isCancel = text == "cancel" || desc == "cancel" ||
-                        text.contains("cancel") || desc.contains("cancel") ||
-                        text.contains("cancelar") || text.contains("annuler") ||
-                        text.contains("abbrechen") || text.contains("취소") ||
-                        viewId.endsWith("button2")
-
-                if (isCancel) continue
-
-                val isPositive = text == "ok" || desc == "ok" ||
-                        text == "force stop" || desc == "force stop" ||
-                        text.contains("force stop") || desc.contains("force stop") ||
-                        text == "yes" || desc == "yes" ||
-                        text.contains("forzar") || text.contains("forcer") ||
-                        text.contains("stopp") || text.contains("beenden") ||
-                        text.contains("확인") || text.contains("강제") ||
-                        hasDialogContent
-
-                if (isPositive && btn.isEnabled) {
-                    if (performClickWithFallback(btn)) {
-                        return true
-                    }
-                }
-            }
-
-            return false
-        } finally {
-            for (btn in candidates) {
-                try { btn.recycle() } catch (ignored: Exception) {}
-            }
-            while (queue.isNotEmpty()) {
-                val (node, _) = queue.removeFirst()
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
-    }
-
-    private fun handleForceStopButton(root: AccessibilityNodeInfo, pkgName: String): ForceStopActionResult {
-        val targetNode = findForceStopButtonNode(root) ?: return ForceStopActionResult.NONE
-
-        try {
-            if (!targetNode.isEnabled) {
-                // Button is disabled -> App is ALREADY stopped!
-                return ForceStopActionResult.ALREADY_DISABLED
-            }
-
-            // Button is enabled -> Click it!
-            val clicked = performClickWithFallback(targetNode)
-            if (clicked) {
-                return ForceStopActionResult.FORCE_STOP_CLICKED
             }
             return ForceStopActionResult.NONE
         } finally {
-            try { targetNode.recycle() } catch (ignored: Exception) {}
+            snapshots.forEach { it.release() }
+            roots.forEach { safeRecycle(it) }
         }
     }
 
-    private fun findForceStopButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val oemResourceIds = listOf(
-            "com.android.settings:id/force_stop_button",
-            "com.google.android.settings:id/force_stop_button",
-            "com.samsung.android.settings:id/force_stop_button",
-            "com.android.settings:id/right_button",           // Samsung OneUI bottom-right button
-            "com.samsung.android.settings:id/right_button",   // Samsung OneUI bottom-right button
-            "com.samsung.android.settings:id/bottom_btn_force_stop",
-            "com.samsung.android.settings:id/app_control_force_stop",
-            "com.android.settings:id/button3",
-            "com.android.settings:id/button_force_stop",
-            "com.android.settings:id/btn_force_stop"
+    private class QueuedNode(val node: AccessibilityNodeInfo, val depth: Int)
+
+    /** Everything one traversal of a window learns; owns the nodes it keeps. */
+    private class ForceStopSnapshot {
+        var dialogPresent = false
+        var positive: AccessibilityNodeInfo? = null
+        var forceStop: AccessibilityNodeInfo? = null
+        val candidates = ArrayList<AccessibilityNodeInfo>()
+        private val owned = ArrayList<AccessibilityNodeInfo>()
+
+        fun own(node: AccessibilityNodeInfo) {
+            if (owned.isEmpty() || owned[owned.size - 1] !== node) owned.add(node)
+        }
+
+        fun release() {
+            owned.forEach { safeRecycle(it) }
+            owned.clear()
+            candidates.clear()
+            positive = null
+            forceStop = null
+        }
+    }
+
+    private fun inspectForceStop(root: AccessibilityNodeInfo, snap: ForceStopSnapshot) {
+        val pkg = root.packageName?.toString().orEmpty()
+
+        // (a) Standard positive dialog button by resource id (cheap, language neutral).
+        val positive = findFirst(
+            kind = KIND_POSITIVE,
+            keys = scopedIds(KIND_POSITIVE, pkg, POSITIVE_ID_NAMES, GLOBAL_POSITIVE_IDS),
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { it.isEnabled }
         )
-
-        for (id in oemResourceIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            for (node in nodes) {
-                if (isLikelyForceStop(node)) {
-                    for (other in nodes) {
-                        if (other != node) {
-                            try { other.recycle() } catch (ignored: Exception) {}
-                        }
-                    }
-                    return node // Caller will recycle targetNode
-                } else {
-                    try { node.recycle() } catch (ignored: Exception) {}
-                }
-            }
+        if (positive != null) {
+            snap.positive = positive
+            snap.own(positive)
+            snap.dialogPresent = true
+            return
         }
 
-        // Shallow traversal (max depth 3, max 25 nodes)
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
+        // (b) Force stop button by resource id.
+        val fsById = findFirst(
+            kind = KIND_FORCE_STOP,
+            keys = scopedIds(KIND_FORCE_STOP, pkg, FORCE_STOP_ID_NAMES, emptyList()),
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { isLikelyForceStop(it) }
+        )
+        if (fsById != null) {
+            snap.forceStop = fsById
+            snap.own(fsById)
         }
 
+        // (c) One shallow traversal for dialog markers, text buttons and (if needed) Force stop.
+        val queue = ArrayDeque<QueuedNode>()
+        enqueueChildren(root, 1, queue)
         try {
             while (queue.isNotEmpty()) {
-                val (node, depth) = queue.removeFirst()
+                val item = queue.removeFirst()
+                val node = item.node
+                var keep = false
+                try {
+                    val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+                    val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
+                    val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
+                    val className = node.className?.toString().orEmpty()
 
-                if (isLikelyForceStop(node)) {
-                    while (queue.isNotEmpty()) {
-                        val (rem, _) = queue.removeFirst()
-                        try { rem.recycle() } catch (ignored: Exception) {}
+                    if (isDialogMarker(text, viewId, className)) snap.dialogPresent = true
+
+                    if (snap.positive == null && viewId.endsWith("/button1") && node.isEnabled) {
+                        snap.positive = node
+                        snap.own(node)
+                        keep = true
                     }
-                    return node
-                }
 
-                if (depth < 3 && queue.size < 25) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
+                    val clickableOrButton = className.contains("Button", ignoreCase = true) ||
+                            className.contains("TextView", ignoreCase = true) ||
+                            node.isClickable
+                    if (clickableOrButton && (text.isNotEmpty() || desc.isNotEmpty())) {
+                        snap.candidates.add(node)
+                        snap.own(node)
+                        keep = true
                     }
-                }
 
-                try { node.recycle() } catch (ignored: Exception) {}
+                    if (snap.forceStop == null && isLikelyForceStop(viewId, text, desc)) {
+                        snap.forceStop = node
+                        snap.own(node)
+                        keep = true
+                    }
+
+                    if (item.depth < MAX_FORCE_STOP_DEPTH && queue.size < MAX_FORCE_STOP_QUEUE) {
+                        enqueueChildren(node, item.depth + 1, queue)
+                    }
+                } finally {
+                    if (!keep) safeRecycle(node)
+                }
             }
-        } catch (e: Exception) {
-            while (queue.isNotEmpty()) {
-                val (rem, _) = queue.removeFirst()
-                try { rem.recycle() } catch (ignored: Exception) {}
-            }
+        } finally {
+            while (queue.isNotEmpty()) safeRecycle(queue.removeFirst().node)
         }
-
-        return null
     }
+
+    private fun tryClickPositive(snap: ForceStopSnapshot): Boolean {
+        snap.positive?.let { if (performClickWithFallback(it)) return true }
+
+        for (btn in snap.candidates) {
+            val text = btn.text?.toString()?.trim()?.lowercase().orEmpty()
+            val desc = btn.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
+            val viewId = btn.viewIdResourceName?.lowercase().orEmpty()
+
+            val isCancel = text.contains("cancel") || desc.contains("cancel") ||
+                    text.contains("cancelar") || text.contains("annuler") ||
+                    text.contains("abbrechen") || text.contains("취소") ||
+                    viewId.endsWith("button2")
+            if (isCancel) continue
+
+            val isPositive = text == "ok" || desc == "ok" ||
+                    text.contains("force stop") || desc.contains("force stop") ||
+                    text == "yes" || desc == "yes" ||
+                    text.contains("forzar") || text.contains("forcer") ||
+                    text.contains("stopp") || text.contains("beenden") ||
+                    text.contains("확인") || text.contains("강제") ||
+                    snap.dialogPresent
+
+            if (isPositive && btn.isEnabled && performClickWithFallback(btn)) return true
+        }
+        return false
+    }
+
+    private fun findForceStopNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val pkg = root.packageName?.toString().orEmpty()
+        findFirst(
+            kind = KIND_FORCE_STOP,
+            keys = scopedIds(KIND_FORCE_STOP, pkg, FORCE_STOP_ID_NAMES, emptyList()),
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { isLikelyForceStop(it) }
+        )?.let { return it }
+        return bfsFindFirst(root, MAX_FORCE_STOP_DEPTH, MAX_FORCE_STOP_QUEUE) { isLikelyForceStop(it) }
+    }
+
+    private fun isDialogMarker(text: String, viewId: String, className: String): Boolean =
+        text.contains("if you force stop") ||
+                text.contains("may misbehave") ||
+                text.contains("cause errors") ||
+                text.contains("force stop?") ||
+                text.contains("forcer l'arrêt ?") ||
+                text.contains("¿forzar detención?") ||
+                viewId.endsWith("alerttitle") ||
+                viewId.contains("parentpanel") ||
+                viewId.contains("buttonpanel") ||
+                className.contains("dialog", ignoreCase = true)
 
     private fun isLikelyForceStop(node: AccessibilityNodeInfo): Boolean {
         val viewId = node.viewIdResourceName?.lowercase().orEmpty()
         val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
         val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
+        return isLikelyForceStop(viewId, text, desc)
+    }
 
+    private fun isLikelyForceStop(viewId: String, text: String, desc: String): Boolean {
         // Reject other known action buttons
         if (text.contains("open") || desc.contains("open") ||
             text.contains("uninstall") || desc.contains("uninstall") ||
@@ -567,293 +389,250 @@ class ForceStopAccessibilityService : AccessibilityService() {
             return true
         }
 
-        // Multilingual text checks
-        val stopPhrases = listOf(
-            "force stop",
-            "force-stop",
-            "force close",
-            "forcer l'arrêt",
-            "forcer l'arret",
-            "forzar detención",
-            "forzar detencion",
-            "beenden erzwingen",
-            "stopp erzwingen",
-            "arresto forzato",
-            "forçar parada",
-            "forcar parada",
-            "forceer stop",
-            "wymuś zatrzymanie",
-            "принудительно остановить",
-            "강제 종료",
-            "강제 중지",
-            "強制停止",
-            "强制停止"
-        )
+        return startsWithAny(text, desc, FORCE_STOP_PHRASES)
+    }
 
-        for (phrase in stopPhrases) {
-            if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
-                return true
+    // ---------------------------------------------------------------------------------------
+    // Clear cache
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Scans for and executes Clear Cache workflow:
+     * 1. Priority 1: If "Clear cache" button is visible -> Click it (or detect if already disabled/cleared).
+     * 2. Priority 2: If a confirmation dialog is visible -> Click "OK" / "Clear cache".
+     * 3. Priority 3: If on App Info page -> Find and click "Storage" / "Storage and cache" / "Storage usage" across OEMs.
+     */
+    fun scanAndExecuteClearCache(): ClearCacheActionResult {
+        val roots = getRelevantRoots()
+        if (roots.isEmpty()) return ClearCacheActionResult.NONE
+
+        try {
+            for (root in roots) {
+                val clearCacheNode = (try { findClearCacheButtonNode(root) } catch (e: Exception) { null }) ?: continue
+                try {
+                    if (!clearCacheNode.isEnabled) return ClearCacheActionResult.ALREADY_CLEARED
+                    if (performClickWithFallback(clearCacheNode)) return ClearCacheActionResult.CLEAR_CACHE_CLICKED
+                } finally {
+                    safeRecycle(clearCacheNode)
+                }
             }
-        }
 
-        return false
+            for (root in roots) {
+                val confirmNode = (try { findDialogConfirmNode(root) } catch (e: Exception) { null }) ?: continue
+                try {
+                    if (performClickWithFallback(confirmNode)) return ClearCacheActionResult.CLEAR_CACHE_CLICKED
+                } finally {
+                    safeRecycle(confirmNode)
+                }
+            }
+
+            for (root in roots) {
+                val storageNode = (try { findStorageNode(root) } catch (e: Exception) { null }) ?: continue
+                try {
+                    if (performClickWithFallback(storageNode)) return ClearCacheActionResult.STORAGE_CLICKED
+                } finally {
+                    safeRecycle(storageNode)
+                }
+            }
+
+            return ClearCacheActionResult.NONE
+        } finally {
+            roots.forEach { safeRecycle(it) }
+        }
     }
 
     private fun findClearCacheButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val targetIds = listOf(
-            "com.android.settings:id/button_clear_cache",
-            "com.android.settings:id/clear_cache_button",
-            "com.android.settings:id/clear_cache",
-            "android:id/button_clear_cache",
-            "com.miui.securitycenter:id/clear_cache"
-        )
-        for (id in targetIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                val result = nodes.first()
-                for (i in 1 until nodes.size) {
-                    try { nodes[i].recycle() } catch (ignored: Exception) {}
-                }
-                return result
-            }
-        }
+        val pkg = root.packageName?.toString().orEmpty()
+        findFirst(
+            kind = KIND_CLEAR_CACHE_ID,
+            keys = scopedIds(KIND_CLEAR_CACHE_ID, pkg, CLEAR_CACHE_ID_NAMES, GLOBAL_CLEAR_CACHE_IDS),
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { true }
+        )?.let { return it }
 
-        // Fast text search
-        for (phrase in clearCachePhrases) {
-            val nodes = root.findAccessibilityNodeInfosByText(phrase)
-            for (node in nodes) {
-                if (isClearCacheMatch(node)) {
-                    for (other in nodes) {
-                        if (other != node) {
-                            try { other.recycle() } catch (ignored: Exception) {}
-                        }
-                    }
-                    return node
-                }
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
+        findFirst(
+            kind = KIND_CLEAR_CACHE_TEXT,
+            keys = CLEAR_CACHE_SEARCH_TOKENS,
+            query = { root.findAccessibilityNodeInfosByText(it) },
+            accept = { isClearCacheMatch(it) }
+        )?.let { return it }
 
-        // Shallow hierarchy traversal capped at depth 4
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
-        }
-
-        while (queue.isNotEmpty()) {
-            val (node, depth) = queue.removeFirst()
-            if (isClearCacheMatch(node)) {
-                while (queue.isNotEmpty()) {
-                    try { queue.removeFirst().first.recycle() } catch (ignored: Exception) {}
-                }
-                return node
-            }
-
-            if (depth < 4 && queue.size < 40) {
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                }
-            }
-            try { node.recycle() } catch (ignored: Exception) {}
-        }
-
-        return null
+        return bfsFindFirst(root, 4, 40) { isClearCacheMatch(it) }
     }
 
     private fun isClearCacheMatch(node: AccessibilityNodeInfo): Boolean {
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+        if (viewId.contains("clear_cache") || viewId.contains("button_clear_cache")) return true
         val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
         val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
-        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
-
-        if (viewId.contains("clear_cache") || viewId.contains("button_clear_cache")) {
-            return true
-        }
-
-        for (phrase in clearCachePhrases) {
-            if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
-                return true
-            }
-        }
-        return false
+        return startsWithAny(text, desc, CLEAR_CACHE_PHRASES)
     }
 
     private fun findStorageNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val targetIds = listOf(
-            "com.android.settings:id/storage_settings",
-            "com.android.settings:id/storage",
-            "com.android.settings:id/storage_row",
-            "com.android.settings:id/manage_storage",
-            "com.coloros.safecenter:id/storage",
-            "com.miui.securitycenter:id/storage"
-        )
-        for (id in targetIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                val result = nodes.first()
-                for (i in 1 until nodes.size) {
-                    try { nodes[i].recycle() } catch (ignored: Exception) {}
-                }
-                return result
-            }
-        }
+        val pkg = root.packageName?.toString().orEmpty()
+        findFirst(
+            kind = KIND_STORAGE_ID,
+            keys = scopedIds(KIND_STORAGE_ID, pkg, STORAGE_ID_NAMES, emptyList()),
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { true }
+        )?.let { return it }
 
-        // Text search across OEM phrases (Pixel: "Storage and cache", Samsung: "Storage", OnePlus: "Storage usage", Xiaomi: "Storage", etc.)
-        for (phrase in storagePhrases) {
-            val nodes = root.findAccessibilityNodeInfosByText(phrase)
-            for (node in nodes) {
-                if (isStorageMatch(node)) {
-                    for (other in nodes) {
-                        if (other != node) {
-                            try { other.recycle() } catch (ignored: Exception) {}
-                        }
-                    }
-                    return node
-                }
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
+        // Text search across OEM phrases (Pixel: "Storage and cache", Samsung: "Storage", OnePlus: "Storage usage", ...)
+        findFirst(
+            kind = KIND_STORAGE_TEXT,
+            keys = STORAGE_SEARCH_TOKENS,
+            query = { root.findAccessibilityNodeInfosByText(it) },
+            accept = { isStorageMatch(it) }
+        )?.let { return it }
 
-        // Traversal
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
-        }
-
-        while (queue.isNotEmpty()) {
-            val (node, depth) = queue.removeFirst()
-            if (isStorageMatch(node)) {
-                while (queue.isNotEmpty()) {
-                    try { queue.removeFirst().first.recycle() } catch (ignored: Exception) {}
-                }
-                return node
-            }
-
-            if (depth < 4 && queue.size < 40) {
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                }
-            }
-            try { node.recycle() } catch (ignored: Exception) {}
-        }
-
-        return null
+        return bfsFindFirst(root, 4, 40) { isStorageMatch(it) }
     }
 
     private fun isStorageMatch(node: AccessibilityNodeInfo): Boolean {
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+        if (viewId.contains("storage_settings") || viewId.contains("manage_storage")) return true
         val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
         val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
-        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
-
-        if (viewId.contains("storage_settings") || viewId.contains("manage_storage")) {
-            return true
-        }
-
-        for (phrase in storagePhrases) {
-            if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
-                return true
-            }
-        }
-        return false
+        return startsWithAny(text, desc, STORAGE_PHRASES)
     }
 
     private fun findDialogConfirmNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val dialogIds = listOf(
-            "android:id/button1",
-            "com.android.settings:id/button1",
-            "android:id/ok"
-        )
-        for (id in dialogIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                val result = nodes.first()
-                for (i in 1 until nodes.size) {
-                    try { nodes[i].recycle() } catch (ignored: Exception) {}
-                }
-                return result
-            }
-        }
+        findFirst(
+            kind = KIND_CONFIRM_ID,
+            keys = CONFIRM_IDS,
+            query = { root.findAccessibilityNodeInfosByViewId(it) },
+            accept = { true }
+        )?.let { return it }
 
-        val confirmPhrases = listOf("ok", "clear cache", "clear")
-        for (phrase in confirmPhrases) {
-            val nodes = root.findAccessibilityNodeInfosByText(phrase)
-            for (node in nodes) {
+        return findFirst(
+            kind = KIND_CONFIRM_TEXT,
+            keys = CONFIRM_PHRASES,
+            query = { root.findAccessibilityNodeInfosByText(it) },
+            accept = { node ->
                 val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
-                if (text == phrase) {
-                    for (other in nodes) {
-                        if (other != node) {
-                            try { other.recycle() } catch (ignored: Exception) {}
+                text in CONFIRM_PHRASES
+            }
+        )
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Window / node helpers
+    // ---------------------------------------------------------------------------------------
+
+    /** Root nodes of the windows worth inspecting (topmost first). Caller must recycle them. */
+    private fun getRelevantRoots(): List<AccessibilityNodeInfo> {
+        val list = ArrayList<AccessibilityNodeInfo>(3)
+        try {
+            val windowList = windows
+            if (!windowList.isNullOrEmpty()) {
+                for (i in windowList.size - 1 downTo 0) {
+                    val window = windowList[i]
+                    try {
+                        val root = window.root
+                        if (root != null) {
+                            if (isRelevantRoot(root)) list.add(root) else safeRecycle(root)
                         }
+                    } catch (ignored: Exception) {
+                    } finally {
+                        try { window.recycle() } catch (ignored: Exception) {}
                     }
-                    return node
                 }
-                try { node.recycle() } catch (ignored: Exception) {}
+            }
+        } catch (ignored: Exception) {}
+
+        if (list.isEmpty()) {
+            try {
+                rootInActiveWindow?.let { if (isRelevantRoot(it)) list.add(it) else safeRecycle(it) }
+            } catch (ignored: Exception) {}
+        }
+        return list
+    }
+
+    private fun isRelevantRoot(root: AccessibilityNodeInfo): Boolean {
+        val pkg = root.packageName?.toString() ?: return false
+        if (pkg == packageName || pkg == "com.android.systemui") return false
+        val allowed = allowedPackages
+        return allowed == null || allowed.contains(pkg)
+    }
+
+    private fun enqueueChildren(node: AccessibilityNodeInfo, depth: Int, queue: ArrayDeque<QueuedNode>) {
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { queue.addLast(QueuedNode(it, depth)) }
+        }
+    }
+
+    /** Breadth-first search. Returns the first accepted node (caller recycles); recycles everything else. */
+    private fun bfsFindFirst(
+        root: AccessibilityNodeInfo,
+        maxDepth: Int,
+        maxQueue: Int,
+        accept: (AccessibilityNodeInfo) -> Boolean
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<QueuedNode>()
+        enqueueChildren(root, 1, queue)
+        try {
+            while (queue.isNotEmpty()) {
+                val item = queue.removeFirst()
+                val node = item.node
+                var matched = false
+                try {
+                    if (accept(node)) {
+                        matched = true
+                        return node
+                    }
+                    if (item.depth < maxDepth && queue.size < maxQueue) {
+                        enqueueChildren(node, item.depth + 1, queue)
+                    }
+                } finally {
+                    if (!matched) safeRecycle(node)
+                }
+            }
+        } finally {
+            while (queue.isNotEmpty()) safeRecycle(queue.removeFirst().node)
+        }
+        return null
+    }
+
+    /**
+     * Tries each key (previously successful key first), returning the first node [accept]s.
+     * All other returned nodes are recycled. Remembers which key worked for next time.
+     */
+    private fun findFirst(
+        kind: String,
+        keys: List<String>,
+        query: (String) -> List<AccessibilityNodeInfo>?,
+        accept: (AccessibilityNodeInfo) -> Boolean
+    ): AccessibilityNodeInfo? {
+        val learned = learnedKeys[kind]
+        if (learned != null && keys.contains(learned)) {
+            pickFirst(query(learned), accept)?.let { return it }
+        }
+        for (key in keys) {
+            if (key == learned) continue
+            val hit = pickFirst(query(key), accept)
+            if (hit != null) {
+                learnedKeys[kind] = key
+                return hit
             }
         }
         return null
     }
 
-    private val storagePhrases = listOf(
-        "storage and cache",
-        "storage & cache",
-        "storage usage",
-        "storage",
-        "internal storage",
-        "stockage et cache",
-        "stockage",
-        "speicher und cache",
-        "speicher",
-        "almacenamiento y caché",
-        "almacenamiento y cache",
-        "almacenamiento",
-        "spazio di archiviazione",
-        "archiviazione e cache",
-        "armazenamento e cache",
-        "armazenamento",
-        "opslag en cache",
-        "opslag",
-        "pamięć i pamięć podręczna",
-        "pamięć",
-        "pamiec",
-        "память и кэш",
-        "хранилище и кэш",
-        "память",
-        "хранилище",
-        "저장용량 및 캐시",
-        "저장공간 및 캐시",
-        "저장공간",
-        "저장용량",
-        "ストレージとキャッシュ",
-        "ストレージ",
-        "存储和缓存",
-        "存储占用",
-        "存储",
-        "儲存空間與快取",
-        "儲存空間"
-    )
-
-    private val clearCachePhrases = listOf(
-        "clear cache",
-        "clean cache",
-        "clear cached data",
-        "vider le cache",
-        "cache leeren",
-        "limpiar caché",
-        "limpiar cache",
-        "svuota cache",
-        "limpar cache",
-        "wis pamięć podręczną",
-        "wyczyść pamięć podręczną",
-        "wyczysc pamiec podreczna",
-        "очистить кэш",
-        "очистить кеш",
-        "캐시 지우기",
-        "キャッシュを消去",
-        "キャッシュをクリア",
-        "清除缓存",
-        "清理缓存",
-        "清除快取",
-        "清理快取"
-    )
+    private fun pickFirst(
+        nodes: List<AccessibilityNodeInfo>?,
+        accept: (AccessibilityNodeInfo) -> Boolean
+    ): AccessibilityNodeInfo? {
+        if (nodes.isNullOrEmpty()) return null
+        var result: AccessibilityNodeInfo? = null
+        for (node in nodes) {
+            if (result == null && (try { accept(node) } catch (e: Exception) { false })) {
+                result = node
+            } else {
+                safeRecycle(node)
+            }
+        }
+        return result
+    }
 
     private fun performClickWithFallback(node: AccessibilityNodeInfo): Boolean {
         // 1. Direct click on node
@@ -867,25 +646,23 @@ class ForceStopAccessibilityService : AccessibilityService() {
         while (parent != null && depth < 3) {
             val nextParent = parent.parent
             if (parent.isClickable && parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                try { parent.recycle() } catch (ignored: Exception) {}
-                try { nextParent?.recycle() } catch (ignored: Exception) {}
+                safeRecycle(parent)
+                nextParent?.let { safeRecycle(it) }
                 return true
             }
-            try { parent.recycle() } catch (ignored: Exception) {}
+            safeRecycle(parent)
             parent = nextParent
             depth++
         }
-        try { parent?.recycle() } catch (ignored: Exception) {}
+        parent?.let { safeRecycle(it) }
 
         // 3. Child click
         for (i in 0 until node.childCount) {
             val child = node.getChild(i)
             if (child != null) {
                 val clicked = child.isClickable && child.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                try { child.recycle() } catch (ignored: Exception) {}
-                if (clicked) {
-                    return true
-                }
+                safeRecycle(child)
+                if (clicked) return true
             }
         }
 
@@ -907,9 +684,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     private fun dispatchGestureClick(x: Float, y: Float) {
         try {
-            val path = Path().apply {
-                moveTo(x, y)
-            }
+            val path = Path().apply { moveTo(x, y) }
             val gesture = GestureDescription.Builder()
                 .addStroke(GestureDescription.StrokeDescription(path, 0, 50))
                 .build()
@@ -927,6 +702,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val EVENT_NOTIFICATION_TIMEOUT_MS = 150L
+        private const val MAX_FORCE_STOP_DEPTH = 3
+        private const val MAX_FORCE_STOP_QUEUE = 25
+
         private val _isServiceActive = MutableStateFlow(false)
         val isServiceActive: StateFlow<Boolean> = _isServiceActive.asStateFlow()
 
@@ -938,6 +717,18 @@ class ForceStopAccessibilityService : AccessibilityService() {
         fun setInstance(service: ForceStopAccessibilityService?) {
             instanceRef = if (service != null) WeakReference(service) else null
         }
+
+        // ---- change signal: lets automation wait for UI events instead of polling ----
+        private val changeSignal = Channel<Unit>(Channel.CONFLATED)
+
+        /** Raises the (conflated) "something changed" signal. Cheap and thread-safe. */
+        fun notifyChange() {
+            changeSignal.trySend(Unit)
+        }
+
+        /** Suspends until the next change signal or the timeout. Returns true if a signal arrived. */
+        suspend fun awaitChange(timeoutMs: Long): Boolean =
+            withTimeoutOrNull(timeoutMs) { changeSignal.receive() } != null
 
         fun isAccessibilitySettingsEnabled(context: Context): Boolean {
             val expectedComponentName = "${context.packageName}/${ForceStopAccessibilityService::class.java.canonicalName}"
@@ -957,5 +748,163 @@ class ForceStopAccessibilityService : AccessibilityService() {
             }
             return false
         }
+
+        // ---- lookup caches ----
+        private const val KIND_POSITIVE = "positive"
+        private const val KIND_FORCE_STOP = "force_stop"
+        private const val KIND_CLEAR_CACHE_ID = "clear_cache_id"
+        private const val KIND_CLEAR_CACHE_TEXT = "clear_cache_text"
+        private const val KIND_STORAGE_ID = "storage_id"
+        private const val KIND_STORAGE_TEXT = "storage_text"
+        private const val KIND_CONFIRM_ID = "confirm_id"
+        private const val KIND_CONFIRM_TEXT = "confirm_text"
+
+        /** Last key (id or search token) that produced a hit, per lookup kind. */
+        private val learnedKeys = ConcurrentHashMap<String, String>()
+        private val scopedIdCache = ConcurrentHashMap<String, List<String>>()
+
+        /** Builds "<pkg>:id/<name>" ids for the window's own package (cached), preceded by [global] ids. */
+        private fun scopedIds(kind: String, pkg: String, names: List<String>, global: List<String>): List<String> =
+            scopedIdCache.getOrPut("$kind|$pkg") {
+                val out = ArrayList<String>(global.size + names.size)
+                out.addAll(global)
+                if (pkg.isNotEmpty()) names.mapTo(out) { "$pkg:id/$it" }
+                out
+            }
+
+        private fun startsWithAny(text: String, desc: String, phrases: List<String>): Boolean {
+            for (phrase in phrases) {
+                if (text.startsWith(phrase) || desc.startsWith(phrase)) return true
+            }
+            return false
+        }
+
+        private val KNOWN_SETTINGS_PACKAGES = setOf(
+            "com.android.settings",
+            "com.google.android.settings",
+            "com.samsung.android.settings"
+        )
+
+        private val POSITIVE_ID_NAMES = listOf("button1", "ok")
+        private val GLOBAL_POSITIVE_IDS = listOf("android:id/button1", "android:id/ok")
+
+        private val FORCE_STOP_ID_NAMES = listOf(
+            "force_stop_button",
+            "right_button",              // Samsung OneUI bottom-right button
+            "bottom_btn_force_stop",
+            "app_control_force_stop",
+            "button3",
+            "button_force_stop",
+            "btn_force_stop"
+        )
+
+        private val CLEAR_CACHE_ID_NAMES = listOf("button_clear_cache", "clear_cache_button", "clear_cache")
+        private val GLOBAL_CLEAR_CACHE_IDS = listOf("android:id/button_clear_cache")
+
+        private val STORAGE_ID_NAMES = listOf("storage_settings", "storage", "storage_row", "manage_storage")
+
+        private val CONFIRM_IDS = listOf("android:id/button1", "com.android.settings:id/button1", "android:id/ok")
+        private val CONFIRM_PHRASES = listOf("ok", "clear cache", "clear")
+
+        private val FORCE_STOP_PHRASES = listOf(
+            "force stop",
+            "force-stop",
+            "force close",
+            "forcer l'arrêt",
+            "forcer l'arret",
+            "forzar detención",
+            "forzar detencion",
+            "beenden erzwingen",
+            "stopp erzwingen",
+            "arresto forzato",
+            "forçar parada",
+            "forcar parada",
+            "forceer stop",
+            "wymuś zatrzymanie",
+            "принудительно остановить",
+            "강제 종료",
+            "강제 중지",
+            "強制停止",
+            "强制停止"
+        )
+
+        /**
+         * findAccessibilityNodeInfosByText does a case-insensitive substring search, so a handful of
+         * short tokens cover every phrase below with far fewer IPC round trips. Results are then
+         * filtered with the exact phrase lists.
+         */
+        private val STORAGE_SEARCH_TOKENS = listOf(
+            "storage", "stockage", "speicher", "almacenamiento", "archiviazione",
+            "armazenamento", "opslag", "pamięć", "pamiec", "память", "хранилище",
+            "저장", "ストレージ", "存储", "儲存空間"
+        )
+
+        private val CLEAR_CACHE_SEARCH_TOKENS = listOf(
+            "cache", "caché", "pamięć podręczną", "pamiec podreczna", "кэш", "кеш",
+            "캐시", "キャッシュ", "缓存", "快取"
+        )
+
+        private val STORAGE_PHRASES = listOf(
+            "storage and cache",
+            "storage & cache",
+            "storage usage",
+            "storage",
+            "internal storage",
+            "stockage et cache",
+            "stockage",
+            "speicher und cache",
+            "speicher",
+            "almacenamiento y caché",
+            "almacenamiento y cache",
+            "almacenamiento",
+            "spazio di archiviazione",
+            "archiviazione e cache",
+            "armazenamento e cache",
+            "armazenamento",
+            "opslag en cache",
+            "opslag",
+            "pamięć i pamięć podręczna",
+            "pamięć",
+            "pamiec",
+            "память и кэш",
+            "хранилище и кэш",
+            "память",
+            "хранилище",
+            "저장용량 및 캐시",
+            "저장공간 및 캐시",
+            "저장공간",
+            "저장용량",
+            "ストレージとキャッシュ",
+            "ストレージ",
+            "存储和缓存",
+            "存储占用",
+            "存储",
+            "儲存空間與快取",
+            "儲存空間"
+        )
+
+        private val CLEAR_CACHE_PHRASES = listOf(
+            "clear cache",
+            "clean cache",
+            "clear cached data",
+            "vider le cache",
+            "cache leeren",
+            "limpiar caché",
+            "limpiar cache",
+            "svuota cache",
+            "limpar cache",
+            "wis pamięć podręczną",
+            "wyczyść pamięć podręczną",
+            "wyczysc pamiec podreczna",
+            "очистить кэш",
+            "очистить кеш",
+            "캐시 지우기",
+            "キャッシュを消去",
+            "キャッシュをクリア",
+            "清除缓存",
+            "清理缓存",
+            "清除快取",
+            "清理快取"
+        )
     }
 }
