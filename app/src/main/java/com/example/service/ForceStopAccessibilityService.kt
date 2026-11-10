@@ -511,15 +511,22 @@ class ForceStopAccessibilityService : AccessibilityService() {
     /** Root nodes of the windows worth inspecting (topmost first). Caller must recycle them. */
     private fun getRelevantRoots(): List<AccessibilityNodeInfo> {
         val list = ArrayList<AccessibilityNodeInfo>(3)
+        var windowCount = 0
+        var nullRoots = 0
         try {
             val windowList = windows
             if (!windowList.isNullOrEmpty()) {
+                windowCount = windowList.size
                 for (i in windowList.size - 1 downTo 0) {
                     val window = windowList[i]
                     try {
                         val root = window.root
-                        if (root != null) {
-                            if (isRelevantRoot(root)) list.add(root) else safeRecycle(root)
+                        if (root == null) {
+                            nullRoots++
+                        } else if (isRelevantRoot(root)) {
+                            list.add(root)
+                        } else {
+                            safeRecycle(root)
                         }
                     } catch (ignored: Exception) {
                     } finally {
@@ -529,11 +536,19 @@ class ForceStopAccessibilityService : AccessibilityService() {
             }
         } catch (ignored: Exception) {}
 
-        if (list.isEmpty()) {
-            try {
-                rootInActiveWindow?.let { if (isRelevantRoot(it)) list.add(it) else safeRecycle(it) }
-            } catch (ignored: Exception) {}
-        }
+        // ALWAYS also consult the active window. On some OEM builds (Samsung One UI) the interactive
+        // `windows` list omits the Settings window or returns a null root for it, while
+        // rootInActiveWindow reliably returns it.
+        var activePkg: String? = null
+        try {
+            val active = rootInActiveWindow
+            if (active != null) {
+                activePkg = active.packageName?.toString()
+                if (isRelevantRoot(active) && !list.contains(active)) list.add(active) else safeRecycle(active)
+            }
+        } catch (ignored: Exception) {}
+
+        debugLog("roots: windows=$windowCount nullRoots=$nullRoots active=$activePkg kept=${list.size}")
         return list
     }
 
