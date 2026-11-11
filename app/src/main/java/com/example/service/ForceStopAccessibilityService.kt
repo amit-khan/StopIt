@@ -32,6 +32,8 @@ enum class ClearCacheActionResult {
 
 class ForceStopAccessibilityService : AccessibilityService() {
 
+    private var isServiceAwake = false
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         _isServiceActive.value = true
@@ -42,6 +44,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         sleepService()
+        isServiceAwake = false
         _isServiceActive.value = false
         setInstance(null)
         return super.onUnbind(intent)
@@ -51,8 +54,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
      * Awakens the service when automation begins:
      * Restricts event filtering strictly to window state and window content changes.
      * Does NOT include FLAG_INCLUDE_NOT_IMPORTANT_VIEWS to keep node allocations minimal.
+     * Avoids redundant IPC binder transactions if already awake.
      */
     fun wakeForAutomation() {
+        if (isServiceAwake) return
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
@@ -62,18 +67,24 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
             info.notificationTimeout = 100
             serviceInfo = info
+            isServiceAwake = true
         } catch (ignored: Exception) {}
     }
 
     /**
      * Puts the service into low-memory sleep mode when idle:
-     * Disables event delivery (eventTypes = 0) so the OS stops sending window events.
+     * Disables event delivery (eventTypes = 0) and resets flags to 0 so the OS completely
+     * stops tracking interactive windows and view IDs when dormant.
+     * Avoids redundant IPC binder transactions if already asleep.
      */
     fun sleepService() {
+        if (!isServiceAwake && serviceInfo?.eventTypes == 0 && serviceInfo?.flags == 0) return
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = 0
+            info.flags = 0
             serviceInfo = info
+            isServiceAwake = false
         } catch (ignored: Exception) {}
     }
 
@@ -270,13 +281,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     private fun isConfirmationDialog(root: AccessibilityNodeInfo): Boolean {
         // Fast-path: targeted ID check for alert dialog titles and panels
-        val dialogIds = listOf(
-            "android:id/alertTitle",
-            "android:id/parentPanel",
-            "android:id/buttonPanel",
-            "com.android.settings:id/parentPanel"
-        )
-        for (id in dialogIds) {
+        for (id in CONFIRMATION_DIALOG_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             if (nodes.isNotEmpty()) {
                 for (node in nodes) {
@@ -337,15 +342,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     private fun handleConfirmationDialog(root: AccessibilityNodeInfo, pkgName: String): Boolean {
         // 1. Direct ID check for standard positive buttons
-        val positiveIds = listOf(
-            "android:id/button1",
-            "com.android.settings:id/button1",
-            "com.samsung.android.settings:id/button1",
-            "com.google.android.settings:id/button1",
-            "android:id/ok",
-            "com.android.settings:id/ok"
-        )
-        for (id in positiveIds) {
+        for (id in POSITIVE_BUTTON_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             for (node in nodes) {
                 try {
@@ -477,20 +474,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun findForceStopButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val oemResourceIds = listOf(
-            "com.android.settings:id/force_stop_button",
-            "com.google.android.settings:id/force_stop_button",
-            "com.samsung.android.settings:id/force_stop_button",
-            "com.android.settings:id/right_button",           // Samsung OneUI bottom-right button
-            "com.samsung.android.settings:id/right_button",   // Samsung OneUI bottom-right button
-            "com.samsung.android.settings:id/bottom_btn_force_stop",
-            "com.samsung.android.settings:id/app_control_force_stop",
-            "com.android.settings:id/button3",
-            "com.android.settings:id/button_force_stop",
-            "com.android.settings:id/btn_force_stop"
-        )
-
-        for (id in oemResourceIds) {
+        for (id in OEM_FORCE_STOP_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             for (node in nodes) {
                 if (isLikelyForceStop(node)) {
@@ -568,29 +552,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
 
         // Multilingual text checks
-        val stopPhrases = listOf(
-            "force stop",
-            "force-stop",
-            "force close",
-            "forcer l'arrêt",
-            "forcer l'arret",
-            "forzar detención",
-            "forzar detencion",
-            "beenden erzwingen",
-            "stopp erzwingen",
-            "arresto forzato",
-            "forçar parada",
-            "forcar parada",
-            "forceer stop",
-            "wymuś zatrzymanie",
-            "принудительно остановить",
-            "강제 종료",
-            "강제 중지",
-            "強制停止",
-            "强制停止"
-        )
-
-        for (phrase in stopPhrases) {
+        for (phrase in STOP_PHRASES) {
             if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
                 return true
             }
@@ -600,14 +562,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun findClearCacheButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val targetIds = listOf(
-            "com.android.settings:id/button_clear_cache",
-            "com.android.settings:id/clear_cache_button",
-            "com.android.settings:id/clear_cache",
-            "android:id/button_clear_cache",
-            "com.miui.securitycenter:id/clear_cache"
-        )
-        for (id in targetIds) {
+        for (id in CLEAR_CACHE_TARGET_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             if (nodes.isNotEmpty()) {
                 val result = nodes.first()
@@ -619,7 +574,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
 
         // Fast text search
-        for (phrase in clearCachePhrases) {
+        for (phrase in CLEAR_CACHE_PHRASES) {
             val nodes = root.findAccessibilityNodeInfosByText(phrase)
             for (node in nodes) {
                 if (isClearCacheMatch(node)) {
@@ -669,7 +624,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
             return true
         }
 
-        for (phrase in clearCachePhrases) {
+        for (phrase in CLEAR_CACHE_PHRASES) {
             if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
                 return true
             }
@@ -678,15 +633,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun findStorageNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val targetIds = listOf(
-            "com.android.settings:id/storage_settings",
-            "com.android.settings:id/storage",
-            "com.android.settings:id/storage_row",
-            "com.android.settings:id/manage_storage",
-            "com.coloros.safecenter:id/storage",
-            "com.miui.securitycenter:id/storage"
-        )
-        for (id in targetIds) {
+        for (id in STORAGE_TARGET_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             if (nodes.isNotEmpty()) {
                 val result = nodes.first()
@@ -698,7 +645,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
 
         // Text search across OEM phrases (Pixel: "Storage and cache", Samsung: "Storage", OnePlus: "Storage usage", Xiaomi: "Storage", etc.)
-        for (phrase in storagePhrases) {
+        for (phrase in STORAGE_PHRASES) {
             val nodes = root.findAccessibilityNodeInfosByText(phrase)
             for (node in nodes) {
                 if (isStorageMatch(node)) {
@@ -748,7 +695,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
             return true
         }
 
-        for (phrase in storagePhrases) {
+        for (phrase in STORAGE_PHRASES) {
             if (text == phrase || desc == phrase || text.startsWith(phrase) || desc.startsWith(phrase)) {
                 return true
             }
@@ -757,12 +704,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun findDialogConfirmNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val dialogIds = listOf(
-            "android:id/button1",
-            "com.android.settings:id/button1",
-            "android:id/ok"
-        )
-        for (id in dialogIds) {
+        for (id in DIALOG_CONFIRM_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             if (nodes.isNotEmpty()) {
                 val result = nodes.first()
@@ -773,8 +715,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
             }
         }
 
-        val confirmPhrases = listOf("ok", "clear cache", "clear")
-        for (phrase in confirmPhrases) {
+        for (phrase in CONFIRM_PHRASES) {
             val nodes = root.findAccessibilityNodeInfosByText(phrase)
             for (node in nodes) {
                 val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
@@ -791,69 +732,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
         return null
     }
-
-    private val storagePhrases = listOf(
-        "storage and cache",
-        "storage & cache",
-        "storage usage",
-        "storage",
-        "internal storage",
-        "stockage et cache",
-        "stockage",
-        "speicher und cache",
-        "speicher",
-        "almacenamiento y caché",
-        "almacenamiento y cache",
-        "almacenamiento",
-        "spazio di archiviazione",
-        "archiviazione e cache",
-        "armazenamento e cache",
-        "armazenamento",
-        "opslag en cache",
-        "opslag",
-        "pamięć i pamięć podręczna",
-        "pamięć",
-        "pamiec",
-        "память и кэш",
-        "хранилище и кэш",
-        "память",
-        "хранилище",
-        "저장용량 및 캐시",
-        "저장공간 및 캐시",
-        "저장공간",
-        "저장용량",
-        "ストレージとキャッシュ",
-        "ストレージ",
-        "存储和缓存",
-        "存储占用",
-        "存储",
-        "儲存空間與快取",
-        "儲存空間"
-    )
-
-    private val clearCachePhrases = listOf(
-        "clear cache",
-        "clean cache",
-        "clear cached data",
-        "vider le cache",
-        "cache leeren",
-        "limpiar caché",
-        "limpiar cache",
-        "svuota cache",
-        "limpar cache",
-        "wis pamięć podręczną",
-        "wyczyść pamięć podręczną",
-        "wyczysc pamiec podreczna",
-        "очистить кэш",
-        "очистить кеш",
-        "캐시 지우기",
-        "キャッシュを消去",
-        "キャッシュをクリア",
-        "清除缓存",
-        "清理缓存",
-        "清除快取",
-        "清理快取"
-    )
 
     private fun performClickWithFallback(node: AccessibilityNodeInfo): Boolean {
         // 1. Direct click on node
@@ -922,11 +800,151 @@ class ForceStopAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         sleepService()
+        isServiceAwake = false
         _isServiceActive.value = false
         setInstance(null)
     }
 
     companion object {
+        val CONFIRMATION_DIALOG_IDS = listOf(
+            "android:id/alertTitle",
+            "android:id/parentPanel",
+            "android:id/buttonPanel",
+            "com.android.settings:id/parentPanel"
+        )
+
+        val POSITIVE_BUTTON_IDS = listOf(
+            "android:id/button1",
+            "com.android.settings:id/button1",
+            "com.samsung.android.settings:id/button1",
+            "com.google.android.settings:id/button1",
+            "android:id/ok",
+            "com.android.settings:id/ok"
+        )
+
+        val OEM_FORCE_STOP_IDS = listOf(
+            "com.android.settings:id/force_stop_button",
+            "com.google.android.settings:id/force_stop_button",
+            "com.samsung.android.settings:id/force_stop_button",
+            "com.android.settings:id/right_button",           // Samsung OneUI bottom-right button
+            "com.samsung.android.settings:id/right_button",   // Samsung OneUI bottom-right button
+            "com.samsung.android.settings:id/bottom_btn_force_stop",
+            "com.samsung.android.settings:id/app_control_force_stop",
+            "com.android.settings:id/button3",
+            "com.android.settings:id/button_force_stop",
+            "com.android.settings:id/btn_force_stop"
+        )
+
+        val STOP_PHRASES = listOf(
+            "force stop",
+            "force-stop",
+            "force close",
+            "forcer l'arrêt",
+            "forcer l'arret",
+            "forzar detención",
+            "forzar detencion",
+            "beenden erzwingen",
+            "stopp erzwingen",
+            "arresto forzato",
+            "forçar parada",
+            "forcar parada",
+            "forceer stop",
+            "wymuś zatrzymanie",
+            "принудительно остановить",
+            "강제 종료",
+            "강제 중지",
+            "強制停止",
+            "强制停止"
+        )
+
+        val CLEAR_CACHE_TARGET_IDS = listOf(
+            "com.android.settings:id/button_clear_cache",
+            "com.android.settings:id/clear_cache_button",
+            "com.android.settings:id/clear_cache",
+            "android:id/button_clear_cache",
+            "com.miui.securitycenter:id/clear_cache"
+        )
+
+        val STORAGE_TARGET_IDS = listOf(
+            "com.android.settings:id/storage_settings",
+            "com.android.settings:id/storage",
+            "com.android.settings:id/storage_row",
+            "com.android.settings:id/manage_storage",
+            "com.coloros.safecenter:id/storage",
+            "com.miui.securitycenter:id/storage"
+        )
+
+        val DIALOG_CONFIRM_IDS = listOf(
+            "android:id/button1",
+            "com.android.settings:id/button1",
+            "android:id/ok"
+        )
+
+        val CONFIRM_PHRASES = listOf("ok", "clear cache", "clear")
+
+        val STORAGE_PHRASES = listOf(
+            "storage and cache",
+            "storage & cache",
+            "storage usage",
+            "storage",
+            "internal storage",
+            "stockage et cache",
+            "stockage",
+            "speicher und cache",
+            "speicher",
+            "almacenamiento y caché",
+            "almacenamiento y cache",
+            "almacenamiento",
+            "spazio di archiviazione",
+            "archiviazione e cache",
+            "armazenamento e cache",
+            "armazenamento",
+            "opslag en cache",
+            "opslag",
+            "pamięć i pamięć podręczna",
+            "pamięć",
+            "pamiec",
+            "память и кэш",
+            "хранилище и кэш",
+            "память",
+            "хранилище",
+            "저장용량 및 캐시",
+            "저장공간 및 캐시",
+            "저장공간",
+            "저장용량",
+            "ストレージとキャッシュ",
+            "ストレージ",
+            "存储和缓存",
+            "存储占用",
+            "存储",
+            "儲存空間與快取",
+            "儲存空間"
+        )
+
+        val CLEAR_CACHE_PHRASES = listOf(
+            "clear cache",
+            "clean cache",
+            "clear cached data",
+            "vider le cache",
+            "cache leeren",
+            "limpiar caché",
+            "limpiar cache",
+            "svuota cache",
+            "limpar cache",
+            "wis pamięć podręczną",
+            "wyczyść pamięć podręczną",
+            "wyczysc pamiec podreczna",
+            "очистить кэш",
+            "очистить кеш",
+            "캐시 지우기",
+            "キャッシュを消去",
+            "キャッシュをクリア",
+            "清除缓存",
+            "清理缓存",
+            "清除快取",
+            "清理快取"
+        )
+
         private val _isServiceActive = MutableStateFlow(false)
         val isServiceActive: StateFlow<Boolean> = _isServiceActive.asStateFlow()
 
