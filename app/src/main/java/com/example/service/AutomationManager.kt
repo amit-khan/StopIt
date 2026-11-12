@@ -28,6 +28,7 @@ sealed interface AutomationProgress {
 }
 
 object AutomationManager {
+    const val EXTRA_RETURNED_FROM_AUTOMATION = "extra_returned_from_automation"
     private val scope = CoroutineScope(Dispatchers.Main)
     private var automationJob: Job? = null
 
@@ -220,14 +221,23 @@ object AutomationManager {
         try {
             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                 data = Uri.fromParts("package", packageName, null)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_NO_HISTORY or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                )
             }
             context.startActivity(intent)
         } catch (e: Exception) {
             // Fallback to general settings if specific app uri fails
             try {
                 val intent = Intent(Settings.ACTION_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_NO_HISTORY or
+                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                    )
                 }
                 context.startActivity(intent)
             } catch (ignored: Exception) {}
@@ -237,7 +247,12 @@ object AutomationManager {
     private fun bringAppToForeground(context: Context) {
         try {
             val intent = Intent(context, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                putExtra(EXTRA_RETURNED_FROM_AUTOMATION, true)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                )
             }
             context.startActivity(intent)
         } catch (e: Exception) {}
