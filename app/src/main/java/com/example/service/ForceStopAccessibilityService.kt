@@ -11,10 +11,12 @@ import android.provider.Settings
 import android.text.TextUtils
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class ForceStopActionResult {
     NONE,
@@ -30,9 +32,16 @@ enum class ClearCacheActionResult {
     ALREADY_CLEARED
 }
 
+private enum class DialogScanResult {
+    CLICKED,
+    DIALOG_PRESENT,
+    NO_DIALOG
+}
+
 class ForceStopAccessibilityService : AccessibilityService() {
 
     private var isServiceAwake = false
+    private val isScanning = AtomicBoolean(false)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -134,46 +143,64 @@ class ForceStopAccessibilityService : AccessibilityService() {
      * Returns ForceStopActionResult indicating exact action taken for multi-attempt handling.
      */
     fun scanAndExecute(targetPackage: String, triggerSource: AccessibilityNodeInfo? = null): ForceStopActionResult {
-        val roots = getAllActiveRootNodes(triggerSource)
-        if (roots.isEmpty()) return ForceStopActionResult.NONE
+        // Prevent concurrent overlapping scans/clicks from onAccessibilityEvent and polling loop
+        if (!isScanning.compareAndSet(false, true)) {
+            try { triggerSource?.recycle() } catch (ignored: Exception) {}
+            return ForceStopActionResult.NONE
+        }
 
         try {
-            // PHASE 1: Handle open confirmation dialog across all active roots FIRST!
-            for (root in roots) {
-                try {
-                    if (handleConfirmationDialog(root, targetPackage)) {
-                        return ForceStopActionResult.CONFIRMATION_CLICKED
-                    }
-                } catch (ignored: Exception) {}
-            }
+            val roots = getAllActiveRootNodes(triggerSource)
+            if (roots.isEmpty()) return ForceStopActionResult.NONE
 
-            // PHASE 2: If a confirmation dialog is detected on screen, DO NOT touch background window!
-            for (root in roots) {
-                try {
-                    if (isConfirmationDialog(root)) {
-                        return ForceStopActionResult.NONE
-                    }
-                } catch (ignored: Exception) {}
-            }
+            try {
+                // PHASE 1A: Ultra-fast ID check for standard confirmation dialog positive buttons across all roots
+                for (root in roots) {
+                    try {
+                        if (tryClickPositiveButtonById(root)) {
+                            return ForceStopActionResult.CONFIRMATION_CLICKED
+                        }
+                    } catch (ignored: Exception) {}
+                }
 
-            // PHASE 3: Only when NO dialog is on screen, search for and click Force Stop button in App Info
-            for (root in roots) {
-                try {
-                    val result = handleForceStopButton(root, targetPackage)
-                    if (result != ForceStopActionResult.NONE) {
-                        return result
-                    }
-                } catch (ignored: Exception) {}
-            }
+                // PHASE 1B + 2: Single-pass combined dialog detection & fallback positive-button scan
+                var dialogDetected = false
+                for (root in roots) {
+                    try {
+                        when (inspectAndHandleConfirmationDialog(root)) {
+                            DialogScanResult.CLICKED -> return ForceStopActionResult.CONFIRMATION_CLICKED
+                            DialogScanResult.DIALOG_PRESENT -> dialogDetected = true
+                            DialogScanResult.NO_DIALOG -> {}
+                        }
+                    } catch (ignored: Exception) {}
+                }
 
-            return ForceStopActionResult.NONE
+                // If a confirmation dialog is on screen, DO NOT touch background Force Stop button
+                if (dialogDetected) {
+                    return ForceStopActionResult.NONE
+                }
+
+                // PHASE 3: Only when NO dialog is on screen, search for and click Force Stop button in App Info
+                for (root in roots) {
+                    try {
+                        val result = handleForceStopButton(root, targetPackage)
+                        if (result != ForceStopActionResult.NONE) {
+                            return result
+                        }
+                    } catch (ignored: Exception) {}
+                }
+
+                return ForceStopActionResult.NONE
+            } finally {
+                // Guarantee immediate recycling of every root node
+                for (root in roots) {
+                    try {
+                        root.recycle()
+                    } catch (ignored: Exception) {}
+                }
+            }
         } finally {
-            // Guarantee immediate recycling of every root node
-            for (root in roots) {
-                try {
-                    root.recycle()
-                } catch (ignored: Exception) {}
-            }
+            isScanning.set(false)
         }
     }
 
@@ -243,32 +270,52 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
     private fun getAllActiveRootNodes(triggerSource: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
         val list = mutableListOf<AccessibilityNodeInfo>()
+        val ownPackage = packageName
 
-        // 1. Add triggerSource if provided
+        // 1. Add triggerSource if provided and not belonging to our own app
         if (triggerSource != null) {
-            list.add(triggerSource)
+            val srcPkg = triggerSource.packageName?.toString()
+            if (srcPkg != ownPackage) {
+                list.add(triggerSource)
+            } else {
+                try { triggerSource.recycle() } catch (ignored: Exception) {}
+            }
         }
 
-        // 2. Inspect all interactive windows in reverse order (topmost / newest dialog first)
+        // 2. Inspect relevant interactive windows in reverse order (topmost / newest dialog first),
+        // prioritizing TYPE_APPLICATION windows over TYPE_SYSTEM and skipping IME/overlays/SystemUI bars
         try {
             val windowList = windows
             if (!windowList.isNullOrEmpty()) {
+                val systemRoots = mutableListOf<AccessibilityNodeInfo>()
                 for (window in windowList.reversed()) {
+                    val wType = window.type
+                    if (wType != AccessibilityWindowInfo.TYPE_APPLICATION &&
+                        wType != AccessibilityWindowInfo.TYPE_SYSTEM
+                    ) {
+                        continue
+                    }
                     window.root?.let { node ->
-                        if (!list.contains(node)) {
+                        val nodePkg = node.packageName?.toString()
+                        val shouldSkip = nodePkg == ownPackage ||
+                                (wType == AccessibilityWindowInfo.TYPE_SYSTEM && nodePkg == "com.android.systemui")
+                        if (shouldSkip || list.contains(node) || systemRoots.contains(node)) {
+                            try { node.recycle() } catch (ignored: Exception) {}
+                        } else if (wType == AccessibilityWindowInfo.TYPE_APPLICATION) {
                             list.add(node)
                         } else {
-                            try { node.recycle() } catch (ignored: Exception) {}
+                            systemRoots.add(node)
                         }
                     }
                 }
+                list.addAll(systemRoots)
             }
         } catch (ignored: Exception) {}
 
-        // 3. Add rootInActiveWindow if not already in list
+        // 3. Add rootInActiveWindow if not already in list and not our own app
         try {
             rootInActiveWindow?.let {
-                if (!list.contains(it)) {
+                if (it.packageName?.toString() != ownPackage && !list.contains(it)) {
                     list.add(it)
                 } else {
                     try { it.recycle() } catch (ignored: Exception) {}
@@ -279,69 +326,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
         return list
     }
 
-    private fun isConfirmationDialog(root: AccessibilityNodeInfo): Boolean {
-        // Fast-path: targeted ID check for alert dialog titles and panels
-        for (id in CONFIRMATION_DIALOG_IDS) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                for (node in nodes) {
-                    try { node.recycle() } catch (ignored: Exception) {}
-                }
-                return true
-            }
-        }
-
-        // Shallow traversal capped at depth 3 and max 25 nodes
-        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
-        for (i in 0 until root.childCount) {
-            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
-        }
-
-        var isDialog = false
-        while (queue.isNotEmpty()) {
-            val (node, depth) = queue.removeFirst()
-            try {
-                val text = node.text?.toString()?.lowercase().orEmpty()
-                val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
-                val viewId = node.viewIdResourceName?.lowercase().orEmpty()
-                val className = node.className?.toString().orEmpty()
-
-                if (text.contains("if you force stop") ||
-                    text.contains("may misbehave") ||
-                    text.contains("cause errors") ||
-                    text.contains("force stop?") ||
-                    text.contains("forcer l'arrêt ?") ||
-                    text.contains("¿forzar detención?") ||
-                    viewId.endsWith("alerttitle") ||
-                    viewId.endsWith("parentpanel") ||
-                    viewId.endsWith("buttonpanel") ||
-                    className.contains("dialog", ignoreCase = true)
-                ) {
-                    isDialog = true
-                    break
-                }
-
-                if (depth < 3 && queue.size < 25) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                    }
-                }
-            } finally {
-                try { node.recycle() } catch (ignored: Exception) {}
-            }
-        }
-
-        // Recycle any remaining nodes in queue
-        while (queue.isNotEmpty()) {
-            val (node, _) = queue.removeFirst()
-            try { node.recycle() } catch (ignored: Exception) {}
-        }
-
-        return isDialog
-    }
-
-    private fun handleConfirmationDialog(root: AccessibilityNodeInfo, pkgName: String): Boolean {
-        // 1. Direct ID check for standard positive buttons
+    private fun tryClickPositiveButtonById(root: AccessibilityNodeInfo): Boolean {
         for (id in POSITIVE_BUTTON_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             for (node in nodes) {
@@ -358,15 +343,31 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 try { node.recycle() } catch (ignored: Exception) {}
             }
         }
+        return false
+    }
 
-        // 2. Shallow traversal to find positive button
+    private fun inspectAndHandleConfirmationDialog(root: AccessibilityNodeInfo): DialogScanResult {
+        var hasDialogContent = false
+
+        // Fast-path: targeted ID check for alert dialog titles and panels
+        for (id in CONFIRMATION_DIALOG_IDS) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (nodes.isNotEmpty()) {
+                for (node in nodes) {
+                    try { node.recycle() } catch (ignored: Exception) {}
+                }
+                hasDialogContent = true
+                break
+            }
+        }
+
+        // Single shallow traversal to detect dialog markers and locate fallback positive button
         val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         for (i in 0 until root.childCount) {
             root.getChild(i)?.let { queue.add(Pair(it, 1)) }
         }
 
         val candidates = mutableListOf<AccessibilityNodeInfo>()
-        var hasDialogContent = false
 
         try {
             while (queue.isNotEmpty()) {
@@ -376,13 +377,18 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
                 val className = node.className?.toString().orEmpty()
 
-                if (text.contains("if you force stop") ||
-                    text.contains("may misbehave") ||
-                    text.contains("cause errors") ||
-                    text.contains("force stop?") ||
-                    viewId.contains("parentpanel") ||
-                    viewId.contains("buttonpanel") ||
-                    className.contains("dialog", ignoreCase = true)
+                if (!hasDialogContent && (
+                        text.contains("if you force stop") ||
+                        text.contains("may misbehave") ||
+                        text.contains("cause errors") ||
+                        text.contains("force stop?") ||
+                        text.contains("forcer l'arrêt ?") ||
+                        text.contains("¿forzar detención?") ||
+                        viewId.endsWith("alerttitle") ||
+                        viewId.contains("parentpanel") ||
+                        viewId.contains("buttonpanel") ||
+                        className.contains("dialog", ignoreCase = true)
+                    )
                 ) {
                     hasDialogContent = true
                 }
@@ -391,7 +397,13 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 if ((viewId.endsWith(":id/button1") || viewId.endsWith("/button1")) && node.isEnabled) {
                     if (performClickWithFallback(node)) {
                         try { node.recycle() } catch (ignored: Exception) {}
-                        return true
+                        return DialogScanResult.CLICKED
+                    }
+                }
+
+                if (depth < 3 && queue.size < 25) {
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
                     }
                 }
 
@@ -402,12 +414,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     candidates.add(node)
                 } else {
                     try { node.recycle() } catch (ignored: Exception) {}
-                }
-
-                if (depth < 3 && queue.size < 25) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
-                    }
                 }
             }
 
@@ -436,12 +442,12 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
                 if (isPositive && btn.isEnabled) {
                     if (performClickWithFallback(btn)) {
-                        return true
+                        return DialogScanResult.CLICKED
                     }
                 }
             }
 
-            return false
+            return if (hasDialogContent) DialogScanResult.DIALOG_PRESENT else DialogScanResult.NO_DIALOG
         } finally {
             for (btn in candidates) {
                 try { btn.recycle() } catch (ignored: Exception) {}
