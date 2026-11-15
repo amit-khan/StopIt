@@ -1,10 +1,6 @@
 package com.example.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -36,7 +32,6 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
-import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -68,7 +63,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
@@ -91,7 +85,6 @@ import com.example.ui.theme.AccentAmber
 import com.example.ui.theme.AccentBorder
 import com.example.ui.theme.DarkBackground
 import com.example.ui.theme.DarkSurface
-import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.DarkSurfaceVariant
 import com.example.ui.theme.EmeraldOnPrimary
 import com.example.ui.theme.EmeraldPrimary
@@ -114,16 +107,22 @@ fun HomeScreen(
     LaunchedEffect(automationProgress) {
         if (automationProgress is AutomationProgress.Completed) {
             val count = (automationProgress as AutomationProgress.Completed).totalStopped
-            snackbarHostState.showSnackbar(
-                context.getString(R.string.automation_completed, count)
-            )
+            kotlinx.coroutines.withTimeoutOrNull(2000L) {
+                snackbarHostState.showSnackbar(
+                    context.getString(R.string.automation_completed, count)
+                )
+            }
+            snackbarHostState.currentSnackbarData?.dismiss()
             viewModel.resetAutomationProgress()
         }
     }
 
     LaunchedEffect(uiState.snackbarMessage) {
         uiState.snackbarMessage?.let { msg ->
-            snackbarHostState.showSnackbar(msg)
+            kotlinx.coroutines.withTimeoutOrNull(2000L) {
+                snackbarHostState.showSnackbar(msg)
+            }
+            snackbarHostState.currentSnackbarData?.dismiss()
             viewModel.clearSnackbar()
         }
     }

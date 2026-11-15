@@ -47,7 +47,6 @@ import com.example.ui.theme.DarkSurfaceVariant
 import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
-import com.example.ui.theme.TextTertiary
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
