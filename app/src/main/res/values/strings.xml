@@ -51,4 +51,9 @@
     <string name="clear_cache_hint">Clear cache for %1$s</string>
     <string name="usage_access_prompt">Show app cache sizes (Requires Usage Access)</string>
     <string name="cache_label">Cache: %1$s</string>
+
+    <!-- App Shortcuts -->
+    <string name="shortcut_stop_all_short">Force stop all</string>
+    <string name="shortcut_disabled_message">Unable to stop running apps right now</string>
+    <string name="no_running_apps_to_stop">No active apps running to stop.</string>
 </resources>

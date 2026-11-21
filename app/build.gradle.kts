@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.stopit.kmpvza"
     minSdk = 24
     targetSdk = 36
-    versionCode = 11
-    versionName = "2.5"
+    versionCode = 12
+    versionName = "2.6"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

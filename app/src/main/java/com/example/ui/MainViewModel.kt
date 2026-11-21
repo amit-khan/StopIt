@@ -7,6 +7,7 @@ import android.net.Uri
 import android.provider.Settings
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.R
 import com.example.data.db.AppDatabase
 import com.example.data.model.AppInfoItem
 import com.example.data.model.MemoryStats
@@ -15,6 +16,7 @@ import com.example.service.AutomationManager
 import com.example.service.AutomationProgress
 import com.example.service.CacheCleanerAutomationManager
 import com.example.service.ForceStopAccessibilityService
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -44,6 +46,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: AppRepository
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+
+    private var refreshJob: Job? = null
+    private var shortcutJob: Job? = null
 
     val automationProgress: StateFlow<AutomationProgress> = AutomationManager.progress
 
@@ -161,7 +166,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshApps() {
-        viewModelScope.launch {
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             val memStats = repository.getMemoryStats()
             val whitelistedList = repository.whitelistedPackageNames.first()
@@ -193,6 +199,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * preserving scroll position and state on the Whitelist tab.
      */
     fun refreshRunningApps() {
+        if (shortcutJob?.isActive == true || refreshJob?.isActive == true) return
         viewModelScope.launch {
             val memStats = repository.getMemoryStats()
             val whitelistedList = repository.whitelistedPackageNames.first()
@@ -334,6 +341,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         AutomationManager.startAutomation(context, selected) {
             refreshApps()
+        }
+    }
+
+    /**
+     * Triggered from the launcher App Shortcut: scans all current non-whitelisted
+     * running apps and immediately starts force-stopping all of them in one go.
+     */
+    fun stopAllRunningApps(context: Context) {
+        val appContext = context.applicationContext
+        checkAccessibilityStatus()
+        if (!_uiState.value.isAccessibilityEnabled) {
+            _uiState.update {
+                it.copy(
+                    currentTab = 0,
+                    showAddAppsDialog = false,
+                    showAccessibilityDialog = true
+                )
+            }
+            return
+        }
+
+        if (AutomationManager.progress.value is AutomationProgress.Running) {
+            _uiState.update { it.copy(currentTab = 0, showAddAppsDialog = false) }
+            return
+        }
+
+        refreshJob?.cancel()
+        shortcutJob?.cancel()
+        shortcutJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    currentTab = 0,
+                    showAddAppsDialog = false,
+                    isLoading = true
+                )
+            }
+
+            val memStats = repository.getMemoryStats()
+            val whitelistedSet = repository.whitelistedPackageNames.first().toSet()
+            val running = repository.getRunningApps(whitelistedSet)
+            val whitelistedOnly = repository.getWhitelistedAppsOnly()
+            val usageGranted = repository.isUsageAccessGranted()
+
+            _uiState.update {
+                it.copy(
+                    memoryStats = memStats,
+                    runningApps = running,
+                    whitelistedApps = whitelistedOnly,
+                    isUsageAccessGranted = usageGranted,
+                    isLoading = false,
+                    snackbarMessage = if (running.isEmpty()) {
+                        appContext.getString(R.string.no_running_apps_to_stop)
+                    } else {
+                        it.snackbarMessage
+                    }
+                )
+            }
+
+            if (running.isNotEmpty()) {
+                AutomationManager.startAutomation(appContext, running) {
+                    refreshApps()
+                }
+            }
         }
     }
 

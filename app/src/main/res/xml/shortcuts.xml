@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="stop_all_running_apps"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_stop_all"
+        android:shortcutShortLabel="@string/shortcut_stop_all_short"
+        android:shortcutLongLabel="@string/shortcut_stop_all_short"
+        android:shortcutDisabledMessage="@string/shortcut_disabled_message">
+        <intent
+            android:action="com.example.action.STOP_ALL_RUNNING"
+            android:targetPackage="com.aistudio.stopit.kmpvza"
+            android:targetClass="com.example.MainActivity" />
+    </shortcut>
+</shortcuts>

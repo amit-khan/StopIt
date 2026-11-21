@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         onBackPressedDispatcher.addCallback(this, automationBackCallback)
         updateAutomationReturnFlag(intent)
+        handleShortcutIntent(intent)
         setContent {
             StopItTheme {
                 HomeScreen(
@@ -51,11 +52,21 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         updateAutomationReturnFlag(intent)
+        handleShortcutIntent(intent)
     }
 
     private fun updateAutomationReturnFlag(intent: Intent?) {
         automationBackCallback.isEnabled =
             intent?.getBooleanExtra(AutomationManager.EXTRA_RETURNED_FROM_AUTOMATION, false) == true
+    }
+
+    private fun handleShortcutIntent(intent: Intent?) {
+        if (intent?.action == ACTION_STOP_ALL_RUNNING &&
+            !intent.getBooleanExtra(EXTRA_SHORTCUT_CONSUMED, false)
+        ) {
+            intent.putExtra(EXTRA_SHORTCUT_CONSUMED, true)
+            viewModel.stopAllRunningApps(this)
+        }
     }
 
     override fun onResume() {
@@ -66,5 +77,10 @@ class MainActivity : ComponentActivity() {
         if (viewModel.uiState.value.currentTab == 0) {
             viewModel.refreshRunningApps()
         }
+    }
+
+    companion object {
+        const val ACTION_STOP_ALL_RUNNING = "com.example.action.STOP_ALL_RUNNING"
+        private const val EXTRA_SHORTCUT_CONSUMED = "extra_shortcut_consumed"
     }
 }
