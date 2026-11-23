@@ -62,7 +62,7 @@ object AutomationManager {
                 for (i in queue.indices) {
                     currentIndex = i
                     val app = queue[i]
-                    _currentAppPackage.value = app.packageName
+                    _currentAppPackage.value = null
 
                     _progress.value = AutomationProgress.Running(
                         currentApp = app,
@@ -88,9 +88,10 @@ object AutomationManager {
                         openAppDetailsSettings(context, app.packageName)
                     }
 
-                    // Brief settle so the newly launched App Info activity can start rendering
-                    // and we don't accidentally read a previous app's closing Settings screen
-                    delay(45)
+                    // Allow the newly launched App Info activity to transition onto screen
+                    // before activating accessibility event scanning for this package
+                    delay(130)
+                    _currentAppPackage.value = app.packageName
 
                     // Allow up to 3 attempts to force-stop the app if it refuses to stop
                     val maxAttempts = 3
@@ -100,7 +101,7 @@ object AutomationManager {
                     while (currentAttempt <= maxAttempts && !appIsStopped) {
                         var waitElapsed = 0L
                         val timeoutMs = 3500L
-                        val stepDelay = 50L
+                        val stepDelay = 80L
 
                         while (waitElapsed < timeoutMs && !appIsStopped) {
                             while (_isPaused.value) {
@@ -117,21 +118,23 @@ object AutomationManager {
                                 val result = service.scanAndExecute(app.packageName)
                                 when (result) {
                                     ForceStopActionResult.ALREADY_DISABLED -> {
-                                        appIsStopped = true
-                                        break
+                                        if (waitElapsed > 0L || currentAttempt > 1) {
+                                            appIsStopped = true
+                                            break
+                                        }
                                     }
                                     ForceStopActionResult.CONFIRMATION_CLICKED -> {
                                         // Poll briefly for FLAG_STOPPED / disabled Force Stop button
                                         // instead of waiting a fixed 250ms every time
                                         var confirmWait = 0L
-                                        while (confirmWait < 240L) {
-                                            delay(45)
-                                            confirmWait += 45
+                                        while (confirmWait < 250L) {
+                                            delay(50)
+                                            confirmWait += 50
                                             if (isPackageStopped(context, app.packageName)) {
                                                 appIsStopped = true
                                                 break
                                             }
-                                            if (confirmWait >= 90L && service.isForceStopDisabled()) {
+                                            if (confirmWait >= 100L && service.isForceStopDisabled()) {
                                                 appIsStopped = true
                                                 break
                                             }
@@ -162,7 +165,7 @@ object AutomationManager {
                     stoppedCount++
                     _currentAppPackage.value = null
                     if (i < queue.lastIndex) {
-                        delay(120) // Brief breathing room between apps
+                        delay(50) // Brief breathing room before launching next Settings screen
                     }
                 }
 
