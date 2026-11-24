@@ -41,16 +41,12 @@ object AutomationManager {
     private val _progress = MutableStateFlow<AutomationProgress>(AutomationProgress.Idle)
     val progress: StateFlow<AutomationProgress> = _progress.asStateFlow()
 
-    private var queue: List<AppInfoItem> = emptyList()
-    private var currentIndex = 0
     private var stoppedCount = 0
 
     fun startAutomation(context: Context, appsToStop: List<AppInfoItem>, onComplete: () -> Unit) {
         if (appsToStop.isEmpty()) return
         stopAutomation(context)
 
-        queue = appsToStop
-        currentIndex = 0
         stoppedCount = 0
         _isPaused.value = false
 
@@ -59,15 +55,14 @@ object AutomationManager {
 
         automationJob = scope.launch(Dispatchers.Default) {
             try {
-                for (i in queue.indices) {
-                    currentIndex = i
-                    val app = queue[i]
+                for (i in appsToStop.indices) {
+                    val app = appsToStop[i]
                     _currentAppPackage.value = null
 
                     _progress.value = AutomationProgress.Running(
                         currentApp = app,
                         currentIndex = i + 1,
-                        totalCount = queue.size,
+                        totalCount = appsToStop.size,
                         isPaused = _isPaused.value
                     )
 
@@ -83,6 +78,9 @@ object AutomationManager {
                         continue
                     }
 
+                    // Reset per-app click/cooldown state before opening next Settings page
+                    ForceStopAccessibilityService.instance?.resetAutomationState(app.packageName)
+
                     // Open App Info settings for the target app
                     kotlinx.coroutines.withContext(Dispatchers.Main) {
                         openAppDetailsSettings(context, app.packageName)
@@ -90,18 +88,22 @@ object AutomationManager {
 
                     // Allow the newly launched App Info activity to transition onto screen
                     // before activating accessibility event scanning for this package
-                    delay(130)
+                    delay(200)
                     _currentAppPackage.value = app.packageName
 
-                    // Allow up to 3 attempts to force-stop the app if it refuses to stop
+                    // Allow up to 3 attempts to force-stop the app if Settings lags or drops the launch
                     val maxAttempts = 3
                     var currentAttempt = 1
                     var appIsStopped = false
 
                     while (currentAttempt <= maxAttempts && !appIsStopped) {
                         var waitElapsed = 0L
-                        val timeoutMs = 3500L
+                        val timeoutMs = 2800L
                         val stepDelay = 80L
+                        var consecutiveDisabledCount = 0
+                        var noneStreakMs = 0L
+                        var scrollAttemptsInRound = 0
+                        var awaitingDialogSinceClick = false
 
                         while (waitElapsed < timeoutMs && !appIsStopped) {
                             while (_isPaused.value) {
@@ -115,37 +117,82 @@ object AutomationManager {
 
                             val service = ForceStopAccessibilityService.instance
                             if (service != null) {
+                                // Check if onAccessibilityEvent already clicked confirmation between polls
+                                if (service.wasConfirmationRecentlyClicked(app.packageName, withinMs = 600L)) {
+                                    var confirmWait = 0L
+                                    while (confirmWait < 450L) {
+                                        delay(50)
+                                        confirmWait += 50
+                                        if (isPackageStopped(context, app.packageName)) {
+                                            appIsStopped = true
+                                            break
+                                        }
+                                        if (confirmWait >= 120L && service.isForceStopDisabled()) {
+                                            appIsStopped = true
+                                            break
+                                        }
+                                    }
+                                    if (appIsStopped) break
+                                }
+
                                 val result = service.scanAndExecute(app.packageName)
                                 when (result) {
                                     ForceStopActionResult.ALREADY_DISABLED -> {
-                                        if (waitElapsed > 0L || currentAttempt > 1) {
+                                        noneStreakMs = 0L
+                                        awaitingDialogSinceClick = false
+                                        consecutiveDisabledCount++
+                                        // Guard against transient disabled state while Settings runs
+                                        // async checkForceStop() or finishes activity transition
+                                        if ((waitElapsed >= 320L && consecutiveDisabledCount >= 2) ||
+                                            currentAttempt > 1
+                                        ) {
                                             appIsStopped = true
                                             break
                                         }
                                     }
                                     ForceStopActionResult.CONFIRMATION_CLICKED -> {
+                                        noneStreakMs = 0L
+                                        consecutiveDisabledCount = 0
+                                        awaitingDialogSinceClick = false
                                         // Poll briefly for FLAG_STOPPED / disabled Force Stop button
-                                        // instead of waiting a fixed 250ms every time
                                         var confirmWait = 0L
-                                        while (confirmWait < 250L) {
+                                        while (confirmWait < 500L) {
                                             delay(50)
                                             confirmWait += 50
                                             if (isPackageStopped(context, app.packageName)) {
                                                 appIsStopped = true
                                                 break
                                             }
-                                            if (confirmWait >= 100L && service.isForceStopDisabled()) {
+                                            if (confirmWait >= 120L && service.isForceStopDisabled()) {
                                                 appIsStopped = true
                                                 break
                                             }
                                         }
-                                        break
+                                        if (!appIsStopped) {
+                                            // Confirmation was clicked; wait a bit longer on next attempt if needed
+                                            break
+                                        }
                                     }
                                     ForceStopActionResult.FORCE_STOP_CLICKED -> {
-                                        // Button was clicked, confirmation dialog appears shortly
+                                        noneStreakMs = 0L
+                                        consecutiveDisabledCount = 0
+                                        awaitingDialogSinceClick = true
                                     }
                                     ForceStopActionResult.NONE -> {
-                                        // Window or dialog not yet ready
+                                        consecutiveDisabledCount = 0
+                                        if (!awaitingDialogSinceClick) {
+                                            noneStreakMs += stepDelay
+                                            // If Settings page loaded without exposing Force Stop
+                                            // (e.g., button below the fold or unlaid-out RecyclerView),
+                                            // scroll forward automatically instead of stalling
+                                            if (noneStreakMs >= 700L && scrollAttemptsInRound < 2) {
+                                                scrollAttemptsInRound++
+                                                noneStreakMs = 0L
+                                                service.tryScrollForward()
+                                                delay(220)
+                                                waitElapsed += 220L
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -157,15 +204,22 @@ object AutomationManager {
                         if (!appIsStopped) {
                             currentAttempt++
                             if (currentAttempt <= maxAttempts) {
-                                delay(150) // Small delay before next attempt
+                                ForceStopAccessibilityService.instance?.resetAutomationState(app.packageName)
+                                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                                    openAppDetailsSettings(context, app.packageName)
+                                }
+                                delay(280)
                             }
                         }
                     }
 
-                    stoppedCount++
+                    if (appIsStopped || isPackageStopped(context, app.packageName)) {
+                        stoppedCount++
+                    }
                     _currentAppPackage.value = null
-                    if (i < queue.lastIndex) {
-                        delay(50) // Brief breathing room before launching next Settings screen
+                    ForceStopAccessibilityService.instance?.resetAutomationState(null)
+                    if (i < appsToStop.lastIndex) {
+                        delay(100) // Breathing room so Settings finishes tearing down before next launch
                     }
                 }
 
@@ -207,10 +261,6 @@ object AutomationManager {
         _progress.value = AutomationProgress.Idle
     }
 
-    fun notifyForceStopClicked(packageName: String) {}
-
-    fun notifyAppStopped(packageName: String) {}
-
     private fun isPackageStopped(context: Context, packageName: String): Boolean {
         return try {
             val appInfo = context.packageManager.getApplicationInfo(packageName, 0)
@@ -220,7 +270,7 @@ object AutomationManager {
         }
     }
 
-    private fun openAppDetailsSettings(context: Context, packageName: String) {
+    internal fun openAppDetailsSettings(context: Context, packageName: String) {
         try {
             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                 data = Uri.fromParts("package", packageName, null)
@@ -247,7 +297,7 @@ object AutomationManager {
         }
     }
 
-    private fun bringAppToForeground(context: Context) {
+    internal fun bringAppToForeground(context: Context) {
         try {
             val intent = Intent(context, MainActivity::class.java).apply {
                 putExtra(EXTRA_RETURNED_FROM_AUTOMATION, true)

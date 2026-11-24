@@ -59,9 +59,30 @@ class ForceStopAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
+    @Volatile
+    private var activeTargetPackage: String? = null
+    @Volatile
+    private var lastForceStopClickTimeMs: Long = 0L
+    @Volatile
+    private var lastConfirmedPackage: String? = null
+    @Volatile
+    private var lastConfirmationClickTimeMs: Long = 0L
+
+    fun resetAutomationState(targetPackage: String? = null) {
+        activeTargetPackage = targetPackage
+        lastForceStopClickTimeMs = 0L
+        lastConfirmedPackage = null
+        lastConfirmationClickTimeMs = 0L
+    }
+
+    fun wasConfirmationRecentlyClicked(targetPackage: String, withinMs: Long = 1000L): Boolean {
+        return lastConfirmedPackage == targetPackage &&
+            (System.currentTimeMillis() - lastConfirmationClickTimeMs) <= withinMs
+    }
+
     /**
      * Awakens the service when automation begins:
-     * Restricts event filtering strictly to window state and window content changes.
+     * Restricts event filtering to window state, window content, and scroll changes.
      * Does NOT include FLAG_INCLUDE_NOT_IMPORTANT_VIEWS to keep node allocations minimal.
      * Avoids redundant IPC binder transactions if already awake.
      */
@@ -70,11 +91,13 @@ class ForceStopAccessibilityService : AccessibilityService() {
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
             info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_SCROLLED
             info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            info.flags = AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+            info.flags = AccessibilityServiceInfo.DEFAULT or
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
-            info.notificationTimeout = 100
+            info.notificationTimeout = 50
             serviceInfo = info
             isServiceAwake = true
         } catch (ignored: Exception) {}
@@ -87,6 +110,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
      * Avoids redundant IPC binder transactions if already asleep.
      */
     fun sleepService() {
+        resetAutomationState(null)
         if (!isServiceAwake && serviceInfo?.eventTypes == 0 && serviceInfo?.flags == 0) return
         try {
             val info = serviceInfo ?: AccessibilityServiceInfo()
@@ -112,18 +136,48 @@ class ForceStopAccessibilityService : AccessibilityService() {
      * indicating that the app is now force-stopped.
      */
     fun isForceStopDisabled(): Boolean {
-        val roots = getAllActiveRootNodes(null)
+        val roots = getAllActiveRootNodes(null, refreshNodes = true)
         if (roots.isEmpty()) return false
 
         try {
             for (root in roots) {
                 val node = findForceStopButtonNode(root)
                 if (node != null) {
-                    val disabled = !node.isEnabled
+                    val disabled = !isNodeEffectivelyEnabled(node)
                     try { node.recycle() } catch (ignored: Exception) {}
                     if (disabled) {
                         return true
                     }
+                }
+            }
+            return false
+        } finally {
+            for (root in roots) {
+                try { root.recycle() } catch (ignored: Exception) {}
+            }
+        }
+    }
+
+    /**
+     * Scrolls the primary scrollable container on the App Info page forward when the
+     * Force Stop button is below the fold or hasn't been laid out by RecyclerView yet.
+     */
+    fun tryScrollForward(): Boolean {
+        val roots = getAllActiveRootNodes(null, refreshNodes = true)
+        if (roots.isEmpty()) return false
+
+        try {
+            for (root in roots) {
+                val scrollable = findScrollableNode(root)
+                if (scrollable != null) {
+                    val scrolled = try {
+                        scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+                    } catch (ignored: Exception) {
+                        false
+                    } finally {
+                        try { scrollable.recycle() } catch (ignored: Exception) {}
+                    }
+                    if (scrolled) return true
                 }
             }
             return false
@@ -150,7 +204,13 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
 
         try {
-            val roots = getAllActiveRootNodes(triggerSource)
+            if (activeTargetPackage != targetPackage) {
+                resetAutomationState(targetPackage)
+            }
+
+            // Refresh cached accessibility trees when polling (triggerSource == null) so rapid
+            // consecutive Settings launches never get stuck on a stale node snapshot
+            val roots = getAllActiveRootNodes(triggerSource, refreshNodes = triggerSource == null)
             if (roots.isEmpty()) return ForceStopActionResult.NONE
 
             try {
@@ -158,6 +218,8 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 for (root in roots) {
                     try {
                         if (tryClickPositiveButtonById(root)) {
+                            lastConfirmedPackage = targetPackage
+                            lastConfirmationClickTimeMs = System.currentTimeMillis()
                             return ForceStopActionResult.CONFIRMATION_CLICKED
                         }
                     } catch (ignored: Exception) {}
@@ -168,7 +230,11 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 for (root in roots) {
                     try {
                         when (inspectAndHandleConfirmationDialog(root)) {
-                            DialogScanResult.CLICKED -> return ForceStopActionResult.CONFIRMATION_CLICKED
+                            DialogScanResult.CLICKED -> {
+                                lastConfirmedPackage = targetPackage
+                                lastConfirmationClickTimeMs = System.currentTimeMillis()
+                                return ForceStopActionResult.CONFIRMATION_CLICKED
+                            }
                             DialogScanResult.DIALOG_PRESENT -> dialogDetected = true
                             DialogScanResult.NO_DIALOG -> {}
                         }
@@ -180,11 +246,21 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     return ForceStopActionResult.NONE
                 }
 
+                // Cooldown guard: avoid double-clicking Force Stop while the confirmation dialog
+                // is still animating onto screen (e.g., event scan followed immediately by poll)
+                val now = System.currentTimeMillis()
+                if (now - lastForceStopClickTimeMs < FORCE_STOP_CLICK_COOLDOWN_MS) {
+                    return ForceStopActionResult.NONE
+                }
+
                 // PHASE 3: Only when NO dialog is on screen, search for and click Force Stop button in App Info
                 for (root in roots) {
                     try {
-                        val result = handleForceStopButton(root, targetPackage)
-                        if (result != ForceStopActionResult.NONE) {
+                        val result = handleForceStopButton(root)
+                        if (result == ForceStopActionResult.FORCE_STOP_CLICKED) {
+                            lastForceStopClickTimeMs = System.currentTimeMillis()
+                            return result
+                        } else if (result != ForceStopActionResult.NONE) {
                             return result
                         }
                     } catch (ignored: Exception) {}
@@ -211,7 +287,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
      * 3. Priority 3: If on App Info page -> Find and click "Storage" / "Storage and cache" / "Storage usage" across OEMs.
      */
     fun scanAndExecuteClearCache(): ClearCacheActionResult {
-        val roots = getAllActiveRootNodes(null)
+        val roots = getAllActiveRootNodes(null, refreshNodes = true)
         if (roots.isEmpty()) return ClearCacheActionResult.NONE
 
         try {
@@ -268,7 +344,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun getAllActiveRootNodes(triggerSource: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
+    private fun getAllActiveRootNodes(
+        triggerSource: AccessibilityNodeInfo?,
+        refreshNodes: Boolean = false
+    ): List<AccessibilityNodeInfo> {
         val list = mutableListOf<AccessibilityNodeInfo>()
         val ownPackage = packageName
 
@@ -276,6 +355,9 @@ class ForceStopAccessibilityService : AccessibilityService() {
         if (triggerSource != null) {
             val srcPkg = triggerSource.packageName?.toString()
             if (srcPkg != ownPackage) {
+                if (refreshNodes) {
+                    try { triggerSource.refresh() } catch (ignored: Exception) {}
+                }
                 list.add(triggerSource)
             } else {
                 try { triggerSource.recycle() } catch (ignored: Exception) {}
@@ -301,10 +383,15 @@ class ForceStopAccessibilityService : AccessibilityService() {
                                 (wType == AccessibilityWindowInfo.TYPE_SYSTEM && nodePkg == "com.android.systemui")
                         if (shouldSkip || list.contains(node) || systemRoots.contains(node)) {
                             try { node.recycle() } catch (ignored: Exception) {}
-                        } else if (wType == AccessibilityWindowInfo.TYPE_APPLICATION) {
-                            list.add(node)
                         } else {
-                            systemRoots.add(node)
+                            if (refreshNodes) {
+                                try { node.refresh() } catch (ignored: Exception) {}
+                            }
+                            if (wType == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                                list.add(node)
+                            } else {
+                                systemRoots.add(node)
+                            }
                         }
                     }
                 }
@@ -316,6 +403,9 @@ class ForceStopAccessibilityService : AccessibilityService() {
         try {
             rootInActiveWindow?.let {
                 if (it.packageName?.toString() != ownPackage && !list.contains(it)) {
+                    if (refreshNodes) {
+                        try { it.refresh() } catch (ignored: Exception) {}
+                    }
                     list.add(it)
                 } else {
                     try { it.recycle() } catch (ignored: Exception) {}
@@ -326,12 +416,60 @@ class ForceStopAccessibilityService : AccessibilityService() {
         return list
     }
 
+    private fun hasDialogMarkers(root: AccessibilityNodeInfo): Boolean {
+        for (id in CONFIRMATION_DIALOG_IDS) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (nodes.isNotEmpty()) {
+                for (node in nodes) {
+                    try { node.recycle() } catch (ignored: Exception) {}
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun isSafeDialogButton(node: AccessibilityNodeInfo, rootHasDialogMarkers: Boolean): Boolean {
+        val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+
+        if (text.length > 40 || desc.length > 40) return false
+        if (text.contains("open") || desc.contains("open") ||
+            text.contains("uninstall") || desc.contains("uninstall") ||
+            text.contains("disable") || desc.contains("disable") ||
+            text.contains("cancel") || desc.contains("cancel") ||
+            text.contains("storage") || desc.contains("storage")
+        ) {
+            return false
+        }
+
+        // Standard Android AlertDialog framework IDs are always dialog buttons
+        if (viewId.startsWith("android:id/")) {
+            return true
+        }
+
+        // Settings-scoped button1 can collide with App Info's ActionButtonsPreference "Open" button,
+        // so require either explicit dialog markers in the root or unmistakable positive button text
+        if (rootHasDialogMarkers) {
+            return true
+        }
+
+        return text == "ok" || desc == "ok" ||
+            text == "yes" || desc == "yes" ||
+            text == "확인" || text == "確定" || text == "确定"
+    }
+
     private fun tryClickPositiveButtonById(root: AccessibilityNodeInfo): Boolean {
+        val rootHasDialogMarkers = hasDialogMarkers(root)
         for (id in POSITIVE_BUTTON_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             for (node in nodes) {
                 try {
-                    if (node.isEnabled && performClickWithFallback(node)) {
+                    if (isNodeEffectivelyEnabled(node) &&
+                        isSafeDialogButton(node, rootHasDialogMarkers) &&
+                        performClickWithFallback(node)
+                    ) {
                         for (other in nodes) {
                             try { other.recycle() } catch (ignored: Exception) {}
                         }
@@ -347,31 +485,21 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun inspectAndHandleConfirmationDialog(root: AccessibilityNodeInfo): DialogScanResult {
-        var hasDialogContent = false
+        var hasDialogContent = hasDialogMarkers(root)
 
-        // Fast-path: targeted ID check for alert dialog titles and panels
-        for (id in CONFIRMATION_DIALOG_IDS) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                for (node in nodes) {
-                    try { node.recycle() } catch (ignored: Exception) {}
-                }
-                hasDialogContent = true
-                break
-            }
-        }
-
-        // Single shallow traversal to detect dialog markers and locate fallback positive button
+        // Single bounded traversal to detect dialog markers and locate fallback positive button
         val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         for (i in 0 until root.childCount) {
             root.getChild(i)?.let { queue.add(Pair(it, 1)) }
         }
 
         val candidates = mutableListOf<AccessibilityNodeInfo>()
+        var visited = 0
 
         try {
             while (queue.isNotEmpty()) {
                 val (node, depth) = queue.removeFirst()
+                visited++
                 val viewId = node.viewIdResourceName?.lowercase().orEmpty()
                 val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
                 val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
@@ -393,15 +521,19 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     hasDialogContent = true
                 }
 
-                // If ID ends with button1, click it immediately
-                if ((viewId.endsWith(":id/button1") || viewId.endsWith("/button1")) && node.isEnabled) {
+                // If ID ends with button1 inside an actual dialog, click it immediately
+                if ((viewId == "android:id/button1" ||
+                        (hasDialogContent && (viewId.endsWith(":id/button1") || viewId.endsWith("/button1")))) &&
+                    isNodeEffectivelyEnabled(node) &&
+                    isSafeDialogButton(node, hasDialogContent)
+                ) {
                     if (performClickWithFallback(node)) {
                         try { node.recycle() } catch (ignored: Exception) {}
                         return DialogScanResult.CLICKED
                     }
                 }
 
-                if (depth < 3 && queue.size < 25) {
+                if (depth < 6 && visited + queue.size < 80) {
                     for (i in 0 until node.childCount) {
                         node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
                     }
@@ -417,7 +549,11 @@ class ForceStopAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Evaluate candidates
+            if (!hasDialogContent) {
+                return DialogScanResult.NO_DIALOG
+            }
+
+            // Evaluate candidates only when we know a dialog is on screen
             for (btn in candidates) {
                 val text = btn.text?.toString()?.trim()?.lowercase().orEmpty()
                 val desc = btn.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
@@ -431,6 +567,8 @@ class ForceStopAccessibilityService : AccessibilityService() {
 
                 if (isCancel) continue
 
+                if (text.length > 40 || desc.length > 40) continue
+
                 val isPositive = text == "ok" || desc == "ok" ||
                         text == "force stop" || desc == "force stop" ||
                         text.contains("force stop") || desc.contains("force stop") ||
@@ -438,16 +576,16 @@ class ForceStopAccessibilityService : AccessibilityService() {
                         text.contains("forzar") || text.contains("forcer") ||
                         text.contains("stopp") || text.contains("beenden") ||
                         text.contains("확인") || text.contains("강제") ||
-                        hasDialogContent
+                        text == "確定" || text == "确定"
 
-                if (isPositive && btn.isEnabled) {
+                if (isPositive && isNodeEffectivelyEnabled(btn)) {
                     if (performClickWithFallback(btn)) {
                         return DialogScanResult.CLICKED
                     }
                 }
             }
 
-            return if (hasDialogContent) DialogScanResult.DIALOG_PRESENT else DialogScanResult.NO_DIALOG
+            return DialogScanResult.DIALOG_PRESENT
         } finally {
             for (btn in candidates) {
                 try { btn.recycle() } catch (ignored: Exception) {}
@@ -459,13 +597,19 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun handleForceStopButton(root: AccessibilityNodeInfo, pkgName: String): ForceStopActionResult {
+    private fun handleForceStopButton(root: AccessibilityNodeInfo): ForceStopActionResult {
         val targetNode = findForceStopButtonNode(root) ?: return ForceStopActionResult.NONE
 
         try {
-            if (!targetNode.isEnabled) {
-                // Button is disabled -> App is ALREADY stopped!
+            if (!isNodeEffectivelyEnabled(targetNode)) {
+                // Button is disabled -> App is ALREADY stopped (or still loading)
                 return ForceStopActionResult.ALREADY_DISABLED
+            }
+
+            if (!targetNode.isVisibleToUser) {
+                try {
+                    targetNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
+                } catch (ignored: Exception) {}
             }
 
             // Button is enabled -> Click it!
@@ -479,7 +623,64 @@ class ForceStopAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun isNodeEffectivelyEnabled(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isEnabled) return false
+        if (node.isClickable) return true
+
+        var parent: AccessibilityNodeInfo? = node.parent
+        var depth = 0
+        while (parent != null && depth < 2) {
+            val nextParent = parent.parent
+            if (parent.isClickable) {
+                val enabled = parent.isEnabled
+                try { parent.recycle() } catch (ignored: Exception) {}
+                try { nextParent?.recycle() } catch (ignored: Exception) {}
+                return enabled
+            }
+            try { parent.recycle() } catch (ignored: Exception) {}
+            parent = nextParent
+            depth++
+        }
+        try { parent?.recycle() } catch (ignored: Exception) {}
+        return true
+    }
+
+    private fun findScrollableNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        for (i in 0 until root.childCount) {
+            root.getChild(i)?.let { queue.add(Pair(it, 1)) }
+        }
+        var visited = 0
+        try {
+            while (queue.isNotEmpty()) {
+                val (node, depth) = queue.removeFirst()
+                visited++
+                val supportsScrollForward = node.actionList.any {
+                    it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                }
+                if (node.isScrollable && supportsScrollForward) {
+                    while (queue.isNotEmpty()) {
+                        try { queue.removeFirst().first.recycle() } catch (ignored: Exception) {}
+                    }
+                    return node
+                }
+                if (depth < 10 && visited + queue.size < 120) {
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
+                    }
+                }
+                try { node.recycle() } catch (ignored: Exception) {}
+            }
+        } catch (ignored: Exception) {
+            while (queue.isNotEmpty()) {
+                try { queue.removeFirst().first.recycle() } catch (ignored: Exception) {}
+            }
+        }
+        return null
+    }
+
     private fun findForceStopButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // 1. Fast View ID lookup across OEMs
         for (id in OEM_FORCE_STOP_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
             for (node in nodes) {
@@ -496,15 +697,34 @@ class ForceStopAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Shallow traversal (max depth 3, max 25 nodes)
+        // 2. Fast native text search across entire window hierarchy regardless of depth
+        for (phrase in STOP_PHRASES) {
+            val nodes = root.findAccessibilityNodeInfosByText(phrase)
+            for (node in nodes) {
+                if (isLikelyForceStop(node)) {
+                    for (other in nodes) {
+                        if (other != node) {
+                            try { other.recycle() } catch (ignored: Exception) {}
+                        }
+                    }
+                    return node
+                } else {
+                    try { node.recycle() } catch (ignored: Exception) {}
+                }
+            }
+        }
+
+        // 3. Deep BFS fallback (handles Compose Settings / custom OEMs without standard IDs or text queries)
         val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
         for (i in 0 until root.childCount) {
             root.getChild(i)?.let { queue.add(Pair(it, 1)) }
         }
+        var visited = 0
 
         try {
             while (queue.isNotEmpty()) {
                 val (node, depth) = queue.removeFirst()
+                visited++
 
                 if (isLikelyForceStop(node)) {
                     while (queue.isNotEmpty()) {
@@ -514,7 +734,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
                     return node
                 }
 
-                if (depth < 3 && queue.size < 25) {
+                if (depth < 14 && visited + queue.size < 200) {
                     for (i in 0 until node.childCount) {
                         node.getChild(i)?.let { queue.add(Pair(it, depth + 1)) }
                     }
@@ -537,8 +757,10 @@ class ForceStopAccessibilityService : AccessibilityService() {
         val text = node.text?.toString()?.trim()?.lowercase().orEmpty()
         val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
 
-        // Reject other known action buttons
-        if (text.contains("open") || desc.contains("open") ||
+        // Reject long explanatory text (e.g., dialog body "If you force stop an app...") and other buttons
+        if (text.length > 40 || desc.length > 40 ||
+            text.contains("if you") || desc.contains("if you") ||
+            text.contains("open") || desc.contains("open") ||
             text.contains("uninstall") || desc.contains("uninstall") ||
             text.contains("disable") || desc.contains("disable") ||
             text.contains("cancel") || desc.contains("cancel") ||
@@ -547,7 +769,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
             return false
         }
 
-        // View ID checks for both Pixel and Samsung OneUI
+        // View ID checks for Pixel, AOSP, and Samsung OneUI
         if (viewId.endsWith("force_stop_button") ||
             viewId.endsWith("btn_force_stop") ||
             viewId.endsWith("bottom_btn_force_stop") ||
@@ -710,14 +932,19 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     private fun findDialogConfirmNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        for (id in DIALOG_CONFIRM_IDS) {
+        val rootHasDialogMarkers = hasDialogMarkers(root)
+        for (id in POSITIVE_BUTTON_IDS) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            if (nodes.isNotEmpty()) {
-                val result = nodes.first()
-                for (i in 1 until nodes.size) {
-                    try { nodes[i].recycle() } catch (ignored: Exception) {}
+            for (node in nodes) {
+                if (isNodeEffectivelyEnabled(node) && isSafeDialogButton(node, rootHasDialogMarkers)) {
+                    for (other in nodes) {
+                        if (other != node) {
+                            try { other.recycle() } catch (ignored: Exception) {}
+                        }
+                    }
+                    return node
                 }
-                return result
+                try { node.recycle() } catch (ignored: Exception) {}
             }
         }
 
@@ -778,12 +1005,16 @@ class ForceStopAccessibilityService : AccessibilityService() {
             return true
         }
 
-        // 5. Ultimate fallback: Physical gesture tap at screen bounds
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        if (!bounds.isEmpty && bounds.width() > 0 && bounds.height() > 0) {
-            dispatchGestureClick(bounds.centerX().toFloat(), bounds.centerY().toFloat())
-            return true
+        // 5. Ultimate fallback: Physical gesture tap at screen bounds only when visible on screen
+        if (node.isVisibleToUser) {
+            val bounds = Rect()
+            node.getBoundsInScreen(bounds)
+            if (!bounds.isEmpty && bounds.width() > 0 && bounds.height() > 0 &&
+                bounds.centerX() > 0 && bounds.centerY() > 0
+            ) {
+                dispatchGestureClick(bounds.centerX().toFloat(), bounds.centerY().toFloat())
+                return true
+            }
         }
 
         return false
@@ -812,6 +1043,8 @@ class ForceStopAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private const val FORCE_STOP_CLICK_COOLDOWN_MS = 350L
+
         val CONFIRMATION_DIALOG_IDS = listOf(
             "android:id/alertTitle",
             "android:id/parentPanel",
@@ -834,11 +1067,20 @@ class ForceStopAccessibilityService : AccessibilityService() {
             "com.samsung.android.settings:id/force_stop_button",
             "com.android.settings:id/right_button",           // Samsung OneUI bottom-right button
             "com.samsung.android.settings:id/right_button",   // Samsung OneUI bottom-right button
+            "com.google.android.settings:id/right_button",
             "com.samsung.android.settings:id/bottom_btn_force_stop",
             "com.samsung.android.settings:id/app_control_force_stop",
             "com.android.settings:id/button3",
+            "com.android.settings:id/button2",
+            "com.android.settings:id/button4",
+            "com.android.settings:id/button1",
+            "com.google.android.settings:id/button3",
+            "com.google.android.settings:id/button2",
+            "com.google.android.settings:id/button4",
             "com.android.settings:id/button_force_stop",
-            "com.android.settings:id/btn_force_stop"
+            "com.android.settings:id/btn_force_stop",
+            "com.miui.securitycenter:id/btn_force_stop",
+            "com.miui.securitycenter:id/force_stop"
         )
 
         val STOP_PHRASES = listOf(
@@ -878,12 +1120,6 @@ class ForceStopAccessibilityService : AccessibilityService() {
             "com.android.settings:id/manage_storage",
             "com.coloros.safecenter:id/storage",
             "com.miui.securitycenter:id/storage"
-        )
-
-        val DIALOG_CONFIRM_IDS = listOf(
-            "android:id/button1",
-            "com.android.settings:id/button1",
-            "android:id/ok"
         )
 
         val CONFIRM_PHRASES = listOf("ok", "clear cache", "clear")
@@ -959,7 +1195,7 @@ class ForceStopAccessibilityService : AccessibilityService() {
         val instance: ForceStopAccessibilityService?
             get() = instanceRef?.get()
 
-        fun setInstance(service: ForceStopAccessibilityService?) {
+        private fun setInstance(service: ForceStopAccessibilityService?) {
             instanceRef = if (service != null) WeakReference(service) else null
         }
 

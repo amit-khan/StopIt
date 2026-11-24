@@ -221,25 +221,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Refreshes only the whitelisted apps list from the database.
-     */
-    fun refreshWhitelistedApps() {
-        viewModelScope.launch {
-            var whitelistedOnly = repository.getWhitelistedAppsOnly()
-            val usageGranted = repository.isUsageAccessGranted()
-            if (usageGranted) {
-                whitelistedOnly = repository.populateCacheSizes(whitelistedOnly)
-            }
-            _uiState.update {
-                it.copy(
-                    whitelistedApps = whitelistedOnly,
-                    isUsageAccessGranted = usageGranted
-                )
-            }
-        }
-    }
-
     fun toggleAppSelection(packageName: String) {
         _uiState.update { state ->
             val updated = state.runningApps.map { item ->

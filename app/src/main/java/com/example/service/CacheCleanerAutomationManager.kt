@@ -1,9 +1,6 @@
 package com.example.service
 
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import android.provider.Settings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,18 +26,7 @@ object CacheCleanerAutomationManager {
 
                 // 2. Open App Info settings for the target app
                 withContext(Dispatchers.Main) {
-                    try {
-                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                            data = Uri.fromParts("package", packageName, null)
-                            addFlags(
-                                Intent.FLAG_ACTIVITY_NEW_TASK or
-                                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                    Intent.FLAG_ACTIVITY_NO_HISTORY or
-                                    Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
-                            )
-                        }
-                        context.startActivity(intent)
-                    } catch (ignored: Exception) {}
+                    AutomationManager.openAppDetailsSettings(context, packageName)
                 }
 
                 // 3. Scan & execute:
@@ -54,8 +40,7 @@ object CacheCleanerAutomationManager {
                 while (elapsed < maxDurationMs && !cacheCleared) {
                     val service = ForceStopAccessibilityService.instance
                     if (service != null) {
-                        val result = service.scanAndExecuteClearCache()
-                        when (result) {
+                        when (service.scanAndExecuteClearCache()) {
                             ClearCacheActionResult.CLEAR_CACHE_CLICKED,
                             ClearCacheActionResult.ALREADY_CLEARED -> {
                                 cacheCleared = true
@@ -81,24 +66,10 @@ object CacheCleanerAutomationManager {
 
                 // Bring Stop it back to the foreground
                 withContext(Dispatchers.Main) {
-                    bringAppToForeground(context)
+                    AutomationManager.bringAppToForeground(context)
                     onFinished?.invoke()
                 }
             }
         }
-    }
-
-    private fun bringAppToForeground(context: Context) {
-        try {
-            val intent = Intent(context, com.example.MainActivity::class.java).apply {
-                putExtra(AutomationManager.EXTRA_RETURNED_FROM_AUTOMATION, true)
-                addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_SINGLE_TOP
-                )
-            }
-            context.startActivity(intent)
-        } catch (e: Exception) {}
     }
 }

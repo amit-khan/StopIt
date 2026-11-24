@@ -26,7 +26,6 @@ class AppRepository(
     private val activityManager: ActivityManager =
         context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
-    val whitelistedApps: Flow<List<WhitelistedAppEntity>> = whitelistDao.getAllWhitelisted()
     val whitelistedPackageNames: Flow<List<String>> = whitelistDao.getAllWhitelistedPackageNames()
 
     fun getMemoryStats(): MemoryStats {

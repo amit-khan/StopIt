@@ -1,6 +1,5 @@
 <resources>
     <string name="app_name">Stop it</string>
-    <string name="accessibility_service_name">Stop it Automation</string>
     <string name="accessibility_service_description">Automates closing background apps by clicking Force Stop in system App Settings on your behalf.</string>
 
     <!-- Navigation & Tabs -->
